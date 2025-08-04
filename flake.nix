@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
     nvimConfigs = {
-      url = "path:/home/quentin/.dotfiles/modules/home-manager/dev/neovim";
+      url = "github:NovaWasTakenn/nvimConfigs/main";
       inputs.nixpkgs.follows = "nixpkgs"; # Suis le nixpkgs défini précédemment ou alors nixpkgs alias nix unstable ????
     };
   };
@@ -39,7 +39,7 @@
     packages.${system}.myCli = pkgs.python3Packages.buildPythonPackage rec {
       pname = "nova-cli";
       version = "0.1.0";
-
+      format = "setuptools";
       src = ./.;
 
       propagatedBuildInputs = [

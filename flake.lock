@@ -81,11 +81,11 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1744463964,
-        "narHash": "sha256-LWqduOgLHCFxiTNYi3Uj5Lgz0SR+Xhw3kr/3Xd0GPTM=",
+        "lastModified": 1754214453,
+        "narHash": "sha256-Q/I2xJn/j1wpkGhWkQnm20nShYnG7TI99foDBpXm1SY=",
         "owner": "nixos",
         "repo": "nixpkgs",
-        "rev": "2631b0b7abcea6e640ce31cd78ea58910d31e650",
+        "rev": "5b09dc45f24cf32316283e62aec81ffee3c3e376",
         "type": "github"
       },
       "original": {
@@ -144,14 +144,18 @@
         "nvf": "nvf"
       },
       "locked": {
-        "lastModified": 1,
-        "narHash": "sha256-tHqpyLiLRmDd+78/PLpNrr0uvuglEVeOk3rCdCfThew=",
-        "path": "../dev/neovim",
-        "type": "path"
+        "lastModified": 1754330975,
+        "narHash": "sha256-s0/xboTZCw3Irqs/5phoUbeGLeI/auIFIBe7Kua8ca0=",
+        "owner": "NovaWasTakenn",
+        "repo": "nvimConfigs",
+        "rev": "8cee415a82c7d0b6efdee62dc50181062e8e60f5",
+        "type": "github"
       },
       "original": {
-        "path": "../dev/neovim",
-        "type": "path"
+        "owner": "NovaWasTakenn",
+        "ref": "main",
+        "repo": "nvimConfigs",
+        "type": "github"
       }
     },
     "root": {
