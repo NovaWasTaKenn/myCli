@@ -40,6 +40,8 @@
       pname = "nova-cli";
       version = "0.1.0";
       format = "setuptools";
+      pyproject = true;
+      buildSystem = ["setuptools"];
       src = ./.;
 
       propagatedBuildInputs = [
