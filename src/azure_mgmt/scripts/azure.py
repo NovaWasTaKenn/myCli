@@ -58,8 +58,6 @@ def generate_spc(
     
     Example:
         mycli azure generate-spc rd91381akv01 \\
-            --tenant-id ebaeb74c-eeae-40f8-b755-10b0e2bf7528 \\
-            --identity-id c66c99b0-c213-4f6f-aac2-3a358f1bf262 \\
             --namespace cfm \\
             --output spc.yaml
     """
