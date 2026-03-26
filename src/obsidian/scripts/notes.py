@@ -86,7 +86,7 @@ def mdpdf_pandoc(
         f"--to={dest_format}",
         "--pdf-engine=xelatex",
         "--standalone",
-        "--template=/home/quentin/.dotfiles/modules/home-manager/cli/src/obsidian/pandoc/templates/eisvogel.latex",
+        f"--template={os.getenv("HOME")}/.dotfiles/modules/home-manager/cli/src/obsidian/pandoc/templates/eisvogel.latex",
         "--listings",
         "-V",
         f"lang={lang}",
