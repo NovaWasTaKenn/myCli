@@ -19,6 +19,25 @@
         })
       ];
     };
+    
+    myCli = pkgs.python3Packages.buildPythonPackage rec {
+      pname = "nova-cli";
+      version = "0.1.0";
+      format = "setuptools";
+      src = ./.;
+
+      propagatedBuildInputs = [
+        pkgs.python3Packages.click
+        pkgs.python3Packages.pyyaml
+      ];
+
+      meta = with pkgs.lib; {
+        description = "My personal CLI containing all the custom commands i need";
+        homepage = "https://github.com/NovaWassTakenn/nova-cli";
+        license = licenses.mit;
+        maintainers = with maintainers; [NovaWasTakenn];
+      };
+    };
   in {
     # importing package example
     # packages."x86_64-linux".default =
@@ -36,24 +55,9 @@
       #ENV_VAR = "";
     };
 
-    packages.${system}.myCli = pkgs.python3Packages.buildPythonPackage rec {
-      pname = "nova-cli";
-      version = "0.1.0";
-      format = "setuptools";
-      pyproject = true;
-      buildSystem = ["setuptools"];
-      src = ./.;
-
-      propagatedBuildInputs = [
-        pkgs.python3Packages.click
-      ];
-
-      meta = with pkgs.lib; {
-        description = "My personal CLI containing all the custom commands i need";
-        homepage = "https://github.com/NovaWassTakenn/nova-cli";
-        license = licenses.mit;
-        maintainers = with maintainers; [NovaWasTakenn];
-      };
+    packages.${system} = {
+      myCli = myCli;
+      default = myCli;
     };
   };
 }
