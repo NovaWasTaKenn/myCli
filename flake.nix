@@ -29,6 +29,7 @@
       propagatedBuildInputs = [
         pkgs.python3Packages.click
         pkgs.python3Packages.pyyaml
+        pkgs.python3Packages.python-dotenv
       ];
 
       meta = with pkgs.lib; {
