@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-from .env_config import AKVAKS_SETUP_CICD_SPN_SECRET
+from helpers.env_config import AKVAKS_SETUP_CICD_SPN_SECRET
 
 @click.group()
 def azureFile():

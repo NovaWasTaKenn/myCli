@@ -19,7 +19,7 @@ from .aksAkv import (
     _write_manifests as _write_akv_manifests,
     _backup_and_delete_existing_secrets
 )
-from .env_config import MULTI_KV_CODE, SOCLE_KV_CODE
+from helpers.env_config import MULTI_KV_CODE, SOCLE_KV_CODE
 
 # Import helper functions from azureFile
 from .azureFile import (
@@ -142,6 +142,20 @@ def secretStore_csi_setup(
         # 2. Validate that we have either identity_id or aks_code
         if not aks_code:
             click.echo("Error: --aks-code required", err=True)
+            raise click.Abort()
+
+        if include_multi_kv and not MULTI_KV_CODE:
+            click.echo(
+                "Error: MULTI_KV_CODE is not configured. Set it in .env or environment variables.",
+                err=True,
+            )
+            raise click.Abort()
+
+        if include_certificates_spc and not SOCLE_KV_CODE:
+            click.echo(
+                "Error: SOCLE_KV_CODE is not configured. Set it in .env or environment variables.",
+                err=True,
+            )
             raise click.Abort()
         
         # 3. Ensure Azure Key Vault Secrets Provider addon is enabled (if aks_code provided)
@@ -400,13 +414,11 @@ def kill_agent(name_suffix: str):
         # Delete agent pod with specific suffix
         mycli aks kill-agent my-agent-123
     """
+    import re
     import subprocess
     
     try:
-        # Build the command pipeline
-        command = (
-            f"kubectl config use-context cicd-agents"
-        )
+        command = "kubectl config use-context cicd-agents"
         
         click.echo(f"Switching to cicd-agents context and deleting pods matching suffix :'{name_suffix}'...")
         
@@ -418,54 +430,51 @@ def kill_agent(name_suffix: str):
             text=True
         )
         
-        # Build the command pipeline
-        command = (
-            f"kubectl get pods -o name | grep '{name_suffix}$'"
-        )
-        
-        click.echo(f"Retrieving agent name")
-        
-        # Execute the command using shell
-        agent_name_result = subprocess.run(
-            command,
-            shell=True,
+        click.echo("Retrieving agent name")
+        pods_result = subprocess.run(
+            ["kubectl", "get", "pods", "-o", "name"],
             capture_output=True,
             text=True
         )
 
-        # Print stdout if any
-        if agent_name_result.stdout:
-            click.echo(agent_name_result.stdout)
-        
-        # Check for errors
-        if agent_name_result.returncode != 0:
-            click.echo(f"Error: {agent_name_result.stderr}", err=True)
+        if pods_result.returncode != 0:
+            click.echo(f"Error: {pods_result.stderr}", err=True)
             raise click.Abort()
-        
 
-        agent_name = agent_name_result.stdout.strip()
+        all_pods = [line.strip() for line in pods_result.stdout.splitlines() if line.strip()]
+        pattern = re.compile(rf"^pod/azdevopswin-pipeline-d9.*{re.escape(name_suffix)}$")
+        matching_agents = [pod for pod in all_pods if pattern.match(pod)]
 
-        if not agent_name:
-                click.echo(f"No agent with suffix {name_suffix} found")
-        else :
-            command = (f"kubectl delete {agent_name}") 
-            delete_result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True
+        if not matching_agents:
+            click.echo(f"No agent with suffix {name_suffix} found")
+            return
+
+        if len(matching_agents) > 1:
+            click.echo(
+                f"Error: Multiple agents match suffix '{name_suffix}'. Please use a more specific suffix:",
+                err=True,
             )
+            for pod_name in matching_agents:
+                click.echo(f"  - {pod_name}", err=True)
+            raise click.Abort()
 
-            # Print stdout if any
-            if delete_result.stdout:
-                click.echo(result.stdout)
-            
-            # Check for errors
-            if delete_result.returncode != 0:
-                click.echo(f"Error: {delete_result.stderr}", err=True)
-                raise click.Abort()
-            
-            click.echo("✅ Pods deleted successfully!")
+        agent_name = matching_agents[0]
+        click.echo(f"Matched agent: {agent_name}")
+
+        delete_result = subprocess.run(
+            ["kubectl", "delete", agent_name],
+            capture_output=True,
+            text=True
+        )
+
+        if delete_result.stdout:
+            click.echo(delete_result.stdout)
+
+        if delete_result.returncode != 0:
+            click.echo(f"Error: {delete_result.stderr}", err=True)
+            raise click.Abort()
+
+        click.echo("✅ Pods deleted successfully!")
 
 
  

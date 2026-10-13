@@ -27,9 +27,12 @@
       src = ./.;
 
       propagatedBuildInputs = [
-        pkgs.python3Packages.click
-        pkgs.python3Packages.pyyaml
-        pkgs.python3Packages.python-dotenv
+        pkgs.python313Packages.click
+        pkgs.python313Packages.azure-servicebus
+        pkgs.python313Packages.jmespath
+        pkgs.python313Packages.pyyaml
+        pkgs.python313Packages.python-dotenv
+        pkgs.ripgrep
       ];
 
       meta = with pkgs.lib; {
@@ -48,7 +51,9 @@
       packages = with pkgs; [
         python313
         python313Packages.click
+        python313Packages.azure-servicebus
         python313Packages.cock
+        python313Packages.jmespath
         pythonNvim
       ];
 

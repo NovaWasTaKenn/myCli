@@ -33,7 +33,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import os
 
 from .utils import format_objects_array
-from .env_config import MULTI_KV_CODE, SOCLE_KV_CODE, AKVAKS_SETUP_CICD_SPN_SECRET
+from helpers.env_config import MULTI_KV_CODE, SOCLE_KV_CODE, AKVAKS_SETUP_CICD_SPN_SECRET
 from datetime import datetime
 
 

@@ -11,7 +11,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
-from .env_config import ENVIRONMENTS
+from helpers.env_config import require_environments
 
 
 # Dictionary mapping SPN types to naming patterns
@@ -80,7 +80,7 @@ def renew_secret(
         # Store both secret and appId for multiple environments
         mycli azure spn renew-secret 1381 datalake --env d --env t --store-appid
     """
-    environments_dict = ENVIRONMENTS
+    environments_dict = require_environments()
     
     # Default to all environments if none specified
     if len(environments) < 1:
