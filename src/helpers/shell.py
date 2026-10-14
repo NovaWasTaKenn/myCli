@@ -10,15 +10,21 @@ def run_cmd(
     error_msg: str = "Command failed",
     success_msg: Optional[str] = None,
     capture: bool = True,
+    check: bool = True,
 ) -> Optional[subprocess.CompletedProcess]:
-    """Run a command, logging and aborting on failure. Returns the completed process."""
+    """Run a command, logging and aborting on failure. Returns the completed process.
+
+    With capture=False the command is attached to the terminal (stdin/stdout/stderr
+    inherited) instead of captured. With check=False the completed process is
+    returned even on non-zero exit instead of aborting.
+    """
     try:
         result = subprocess.run(
             cmd,
             capture_output=capture,
             text=True,
-            check=True,
-            stdin=subprocess.DEVNULL,
+            check=check,
+            stdin=subprocess.DEVNULL if capture else None,
         )
     except subprocess.CalledProcessError as e:
         click.secho(f"❌ {error_msg}: {e.stderr or e}", fg="red", err=True)
@@ -36,9 +42,10 @@ def run_cmd_or_dry(
     error_msg: str = "Command failed",
     success_msg: Optional[str] = None,
     capture: bool = True,
+    check: bool = True,
 ) -> Optional[subprocess.CompletedProcess]:
     """Run a command, or log a dry-run message and skip if dry_run is True."""
     if dry_run:
         click.secho(f"⚠️  [DRY RUN] {dry_run_msg}", fg="yellow")
         return None
-    return run_cmd(cmd, error_msg=error_msg, success_msg=success_msg, capture=capture)
+    return run_cmd(cmd, error_msg=error_msg, success_msg=success_msg, capture=capture, check=check)

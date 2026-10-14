@@ -2,7 +2,6 @@
 
 import click
 import csv
-import subprocess
 import json
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, time, timedelta

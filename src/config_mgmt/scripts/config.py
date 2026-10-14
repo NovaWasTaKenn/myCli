@@ -1,6 +1,7 @@
 import click
-import subprocess
 import os
+
+from helpers.shell import run_cmd
 
 
 @click.group
@@ -10,23 +11,13 @@ def config():
 
 @config.command()
 def system_clean():
-    nix_clean = "sudo nix-collect-garbage -d".split(" ")
-    home_clean = "home-manager expire-generations -d".split(" ")
-    nix_orphans = "nix store gc && sudo nix store optimize".split(" ")
-    nix_wipe = "sudo nix profile wipe-history".split(" ")
-    hm_clean_old = "home-manager remove-generations old".split(" ")
-
-    subprocess.run(
-        nix_clean
-        + ["&&"]
-        + home_clean
-        + ["&&"]
-        + nix_orphans
-        + ["&&"]
-        + nix_wipe
-        + ["&&"]
-        + hm_clean_old
-    ).check_returncode()
+    """Clean up old nix generations and optimize the store."""
+    run_cmd("sudo nix-collect-garbage -d".split(), error_msg="nix-collect-garbage failed", capture=False)
+    run_cmd("home-manager expire-generations -d".split(), error_msg="expire-generations failed", capture=False)
+    run_cmd("nix store gc".split(), error_msg="nix store gc failed", capture=False)
+    run_cmd("sudo nix store optimize".split(), error_msg="nix store optimize failed", capture=False)
+    run_cmd("sudo nix profile wipe-history".split(), error_msg="nix profile wipe-history failed", capture=False)
+    run_cmd("home-manager remove-generations old".split(), error_msg="remove-generations failed", capture=False)
 
 
 @config.command()
@@ -40,7 +31,7 @@ def system_clean():
 def update(flakeinput: str, flakepath: str):
     """Command that update a flake's input. By default updates the config's main flake"""
 
-    subprocess.run(
+    run_cmd(
         [
             "nix",
             "flake",
@@ -48,8 +39,10 @@ def update(flakeinput: str, flakepath: str):
             flakeinput,
             "--flake",
             os.path.expanduser(flakepath),
-        ]
-    ).check_returncode()
+        ],
+        error_msg="nix flake update failed",
+        capture=False,
+    )
 
 
 @config.command()
@@ -66,9 +59,9 @@ def reload(flakeinput: str, packagename: str):
         packagename if (packagename != "" and packagename is not None) else flakeinput
     )
 
-    subprocess.run(["nix", "build"] + [f"./#{packagename}"]).check_returncode()
+    run_cmd(["nix", "build", f"./#{packagename}"], error_msg="nix build failed", capture=False)
 
-    subprocess.run(
+    run_cmd(
         [
             "nix",
             "flake",
@@ -76,17 +69,21 @@ def reload(flakeinput: str, packagename: str):
             flakeinput,
             "--flake",
             os.path.expanduser("~/.dotfiles/"),
-        ]
-    ).check_returncode()
+        ],
+        error_msg="nix flake update failed",
+        capture=False,
+    )
 
-    subprocess.run(
+    run_cmd(
         [
             "home-manager",
             "switch",
             "--flake",
             os.path.expanduser("~/.dotfiles/#user"),
-        ]
-    ).check_returncode()
+        ],
+        error_msg="home-manager switch failed",
+        capture=False,
+    )
 
 
 @config.command()
@@ -122,7 +119,7 @@ def rebuild_user(rollback: bool, update: bool, switch: bool):
         + (["--update"] if update else [])
     )
 
-    subprocess.run(args).check_returncode()
+    run_cmd(args, error_msg="home-manager rebuild failed", capture=False)
 
 
 @config.command()
@@ -158,7 +155,7 @@ def rebuild_system(rollback: bool, update: bool, switch: bool):
         + (["--rollback"] if rollback else [])
         + (["--update"] if update else [])
     )
-    subprocess.run(args).check_returncode()
+    run_cmd(args, error_msg="nixos-rebuild failed", capture=False)
 
 
 @config.command()
@@ -206,21 +203,6 @@ def rebuild_all(rollback: bool, update: bool, switch: bool):
         + (["--update"] if update else [])
     )
 
-    subprocess.run(system_args).check_returncode()
+    run_cmd(system_args, error_msg="nixos-rebuild failed", capture=False)
 
-    subprocess.run(user_args).check_returncode()
-
-
-# @click.command()
-## @click.option("--count", default=1, help="Number of greetings.")
-## @click.option("--name", prompt="Your name", help="The person to greet.")
-# def rollback():
-# """Command that rebuilds the current user home-manager config"""
-# subprocess.run(["home-manage", "switch", "--flake", "./#user"]).check_returncode()
-#
-# @click.command()
-## @click.option("--count", default=1, help="Number of greetings.")
-## @click.option("--name", prompt="Your name", help="The person to greet.")
-# def update():
-# """Command that rebuilds the current user home-manager config"""
-# subprocess.run(["home-manage", "switch", "--flake", "./#user"]).check_returncode()
+    run_cmd(user_args, error_msg="home-manager rebuild failed", capture=False)

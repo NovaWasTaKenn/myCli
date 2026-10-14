@@ -3,7 +3,6 @@
 import configparser
 import json
 import os
-import subprocess
 import time
 from urllib import error, request
 from urllib.parse import quote
@@ -12,6 +11,7 @@ from typing import Optional, Tuple
 import click
 
 from helpers.config import require_config
+from helpers.shell import run_cmd
 
 DEFAULT_HOST = "https://accounts.azuredatabricks.net"
 PATCH_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:PatchOp"
@@ -214,15 +214,14 @@ def _resolve_connection(profile: str) -> Tuple[str, str]:
     if token:
         return host, token
 
+    result = run_cmd(
+        ["databricks", "auth", "token", "--host", host, "--profile", profile],
+        error_msg="Failed to obtain token from Databricks CLI. Run 'databricks auth login' to configure your profile",
+    )
     try:
-        result = subprocess.run(
-            ["databricks", "auth", "token", "--host", host, "--profile", profile],
-            capture_output=True, text=True, check=True
-        )
         token = json.loads(result.stdout)["access_token"]
-    except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError) as e:
-        click.secho(f"❌ Failed to obtain token from Databricks CLI: {e}", fg="red", err=True)
-        click.secho("💡 Run 'databricks auth login' to configure your profile.", fg="yellow", err=True)
+    except (KeyError, json.JSONDecodeError) as e:
+        click.secho(f"❌ Failed to parse token from Databricks CLI output: {e}", fg="red", err=True)
         raise click.Abort()
 
     return host, token

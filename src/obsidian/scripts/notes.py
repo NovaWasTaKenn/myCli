@@ -1,6 +1,7 @@
 import click
-import subprocess
 import os
+
+from helpers.shell import run_cmd
 
 
 @click.group()
@@ -12,20 +13,12 @@ def notes():
 @click.argument("name")
 @click.option("--pane", is_flag=True, help="Use a pane instead of a window.")
 def quick(name, pane):
-    try:
-        if pane:
-            # Split the current pane vertically and send the command to the new pane
-            completedProcess = subprocess.run(
-                ["tmux", "split-window", "-v", f'nvim "+ObsidianNew {name}"']
-            )
-        else:
-            # Create a new tmux window and open Neovim with the command
-            completedProcess = subprocess.run(
-                ["tmux", "new-window", f'nvim "+ObsidianNew {name}"']
-            )
-        completedProcess.check_returncode()
-    except Exception as e:
-        click.echo(f"An error occurred: {e}")
+    tmux_cmd = (
+        ["tmux", "split-window", "-v", f'nvim "+ObsidianNew {name}"']
+        if pane
+        else ["tmux", "new-window", f'nvim "+ObsidianNew {name}"']
+    )
+    run_cmd(tmux_cmd, error_msg="Failed to open note in tmux")
 
 
 @notes.command()
@@ -108,10 +101,9 @@ def mdpdf_pandoc(
         args += ["--toc", "-V", "toc-own-page", "-V", "titlepage"]
 
     click.echo(f"pandoc args : {args}")
-    completedProcess = subprocess.run(args, text=True, capture_output=True)
-    click.echo(f"pandoc stdout: {completedProcess.stdout}")
-    click.echo(f"pandoc stderr: {completedProcess.stderr}")
-    completedProcess.check_returncode()
+    result = run_cmd(args, error_msg="pandoc conversion failed")
+    click.echo(f"pandoc stdout: {result.stdout}")
+    click.echo(f"pandoc stderr: {result.stderr}")
 
 
 @notes.command()
@@ -131,4 +123,4 @@ def export(src, dest, start_at) -> None:
         dest,
     ] + ([f"--start_at {start_at}"] if start_at else [])
 
-    subprocess.run(pandoc_args).check_returncode()
+    run_cmd(pandoc_args, error_msg="obsidian-export failed", capture=False)

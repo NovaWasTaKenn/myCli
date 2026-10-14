@@ -1,7 +1,6 @@
 """Azure Data Lake Gen2 commands."""
 
 import click
-import subprocess
 from datetime import datetime, timedelta, timezone
 
 from helpers.config import require_config
@@ -149,74 +148,27 @@ def set_project_groups_acls(
                 click.secho(f"    ⚠️  [DRY RUN] Would recursively update default ACL: {default_acl_readers}", fg="yellow")
             else:
                 try:
-                    # Update access ACL for contributors recursively
-                    click.secho(f"    🔧 Updating access ACL for contributors...", fg="yellow")
-                    click.secho(f"       {acl_contributors}", fg="white", dim=True)
-                    subprocess.run(
-                        [
-                            "az", "storage", "fs", "access", "update-recursive",
-                            "--acl", acl_contributors,
-                            "--path", folder_path,
-                            "--file-system", filesystem,
-                            "--account-name", storage_account,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    
-                    # Update access ACL for readers recursively
-                    click.secho(f"    🔧 Updating access ACL for readers...", fg="yellow")
-                    click.secho(f"       {acl_readers}", fg="white", dim=True)
-                    subprocess.run(
-                        [
-                            "az", "storage", "fs", "access", "update-recursive",
-                            "--acl", acl_readers,
-                            "--path", folder_path,
-                            "--file-system", filesystem,
-                            "--account-name", storage_account,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    
-                    # Update default ACL for contributors recursively
-                    click.secho(f"    🔧 Updating default ACL for contributors...", fg="yellow")
-                    click.secho(f"       {default_acl_contributors}", fg="white", dim=True)
-                    subprocess.run(
-                        [
-                            "az", "storage", "fs", "access", "update-recursive",
-                            "--acl", default_acl_contributors,
-                            "--path", folder_path,
-                            "--file-system", filesystem,
-                            "--account-name", storage_account,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    
-                    # Update default ACL for readers recursively
-                    click.secho(f"    🔧 Updating default ACL for readers...", fg="yellow")
-                    click.secho(f"       {default_acl_readers}", fg="white", dim=True)
-                    subprocess.run(
-                        [
-                            "az", "storage", "fs", "access", "update-recursive",
-                            "--acl", default_acl_readers,
-                            "--path", folder_path,
-                            "--file-system", filesystem,
-                            "--account-name", storage_account,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    
+                    for label, acl in [
+                        ("access ACL for contributors", acl_contributors),
+                        ("access ACL for readers", acl_readers),
+                        ("default ACL for contributors", default_acl_contributors),
+                        ("default ACL for readers", default_acl_readers),
+                    ]:
+                        click.secho(f"    🔧 Updating {label}...", fg="yellow")
+                        click.secho(f"       {acl}", fg="white", dim=True)
+                        run_cmd(
+                            [
+                                "az", "storage", "fs", "access", "update-recursive",
+                                "--acl", acl,
+                                "--path", folder_path,
+                                "--file-system", filesystem,
+                                "--account-name", storage_account,
+                            ],
+                            error_msg=f"Error setting {label} on {folder_path}",
+                        )
+
                     click.secho(f"    ✅ Access and default ACLs set recursively for all children", fg="green", bold=True)
-                    
-                except subprocess.CalledProcessError as e:
-                    click.secho(f"    ❌ Error setting ACLs: {e.stderr}", fg="red", err=True)
+                except click.Abort:
                     click.secho("    ⚠️  Continuing with next folder...", fg="yellow", err=True)
         
         click.echo("")
@@ -309,29 +261,22 @@ def create_ingestion_folders(
             if dry_run:
                 click.secho(f"    ⚠️  [DRY RUN] Would create directory: {folder_path}", fg="yellow")
             else:
-                try:
-                    # Create directory
-                    subprocess.run(
-                        [
-                            "az", "storage", "fs", "directory", "create",
-                            "--name", folder_path,
-                            "--file-system", filesystem,
-                            "--account-name", storage_account,
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    
+                result = run_cmd(
+                    [
+                        "az", "storage", "fs", "directory", "create",
+                        "--name", folder_path,
+                        "--file-system", filesystem,
+                        "--account-name", storage_account,
+                    ],
+                    check=False,
+                )
+                if result.returncode == 0:
                     click.secho(f"    ✅ Folder created successfully", fg="green", bold=True)
-                    
-                except subprocess.CalledProcessError as e:
-                    # Check if the error is because the directory already exists
-                    if "PathAlreadyExists" in e.stderr or "already exists" in e.stderr.lower():
-                        click.secho(f"    ℹ️  Folder already exists (skipping)", fg="blue")
-                    else:
-                        click.secho(f"    ❌ Error creating folder: {e.stderr}", fg="red", err=True)
-                        click.secho("    ⚠️  Continuing with next folder...", fg="yellow", err=True)
+                elif "PathAlreadyExists" in result.stderr or "already exists" in result.stderr.lower():
+                    click.secho(f"    ℹ️  Folder already exists (skipping)", fg="blue")
+                else:
+                    click.secho(f"    ❌ Error creating folder: {result.stderr}", fg="red", err=True)
+                    click.secho("    ⚠️  Continuing with next folder...", fg="yellow", err=True)
         
         click.echo("")
     
@@ -426,22 +371,22 @@ def _setup_blob_container_for_env(
         (readers_name, readers_oid, readers_role),
     ]:
         click.secho(f"  🔧 '{role}' → {group_name}...", fg="yellow")
-        if dry_run:
-            click.secho(f"    ⚠️  [DRY RUN] Would assign role to OID {group_oid} at scope {container_scope}", fg="yellow")
+        result = run_cmd_or_dry(
+            ["az", "role", "assignment", "create",
+             "--assignee", group_oid, "--role", role, "--scope", container_scope],
+            dry_run=dry_run,
+            dry_run_msg=f"Would assign role to OID {group_oid} at scope {container_scope}",
+            check=False,
+        )
+        if result is None:
+            continue
+        if result.returncode == 0:
+            click.secho("    ✅ Role assigned", fg="green")
+        elif "RoleAssignmentExists" in result.stderr or "already exists" in result.stderr.lower():
+            click.secho("    ℹ️  Role assignment already exists (skipping)", fg="blue")
         else:
-            try:
-                subprocess.run(
-                    ["az", "role", "assignment", "create",
-                     "--assignee", group_oid, "--role", role, "--scope", container_scope],
-                    capture_output=True, text=True, check=True
-                )
-                click.secho(f"    ✅ Role assigned", fg="green")
-            except subprocess.CalledProcessError as e:
-                if "RoleAssignmentExists" in e.stderr or "already exists" in e.stderr.lower():
-                    click.secho(f"    ℹ️  Role assignment already exists (skipping)", fg="blue")
-                else:
-                    click.secho(f"    ❌ Error assigning role: {e.stderr}", fg="red", err=True)
-                    raise click.Abort()
+            click.secho(f"    ❌ Error assigning role: {result.stderr}", fg="red", err=True)
+            raise click.Abort()
 
     account_key = run_cmd_or_dry(
             ["az", "storage", "account", "keys", "list",

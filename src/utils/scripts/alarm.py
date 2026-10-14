@@ -5,6 +5,8 @@ import re
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from helpers.shell import run_cmd
+
 
 def _get_notify_command(message: str) -> str:
     """Return the appropriate notification command for the current environment."""
@@ -89,7 +91,7 @@ def _run_rg_count(
 
     cmd.extend(["-e", expression, folder])
 
-    completed = subprocess.run(cmd, text=True, capture_output=True)
+    completed = run_cmd(cmd, check=False)
 
     # rg returns:
     # 0 -> at least one match

@@ -25,7 +25,6 @@ azurefile csi driver :
 """
 
 import click
-import subprocess
 import json
 import yaml
 from pathlib import Path
@@ -33,6 +32,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from .utils import format_objects_array
 from helpers.config import require_config
+from helpers.shell import run_cmd
 
 MULTI_KV_CODE = require_config("multi_kv_code")
 SOCLE_KV_CODE = require_config("socle_kv_code")
@@ -55,35 +55,31 @@ def _ensure_akv_addon_enabled(aks_code: str, aks_env: str) -> None:
     click.echo(f"{'='*60}\n")
     
     # Check if addon is already enabled
-    result = subprocess.run(
-        ["az", "aks", "show", 
+    result = run_cmd(
+        ["az", "aks", "show",
          "--resource-group", resource_group,
          "--name", cluster_name,
          "--query", "addonProfiles.azureKeyvaultSecretsProvider.enabled",
          "-o", "tsv"],
-        capture_output=True,
-        text=True,
-        check=True
+        error_msg=f"Error checking addons on {cluster_name}",
     )
-    
+
     is_enabled = result.stdout.strip().lower() == "true"
-    
+
     if is_enabled:
         click.echo(f"  ✅ Azure Key Vault Secrets Provider addon is already enabled on {cluster_name}")
     else:
         click.echo(f"  ⚠️  Azure Key Vault Secrets Provider addon is not enabled")
         click.echo(f"  Enabling addon on {cluster_name}...")
-        
-        subprocess.run(
+
+        run_cmd(
             ["az", "aks", "enable-addons",
              "--addons", "azure-keyvault-secrets-provider",
              "--name", cluster_name,
              "--resource-group", resource_group],
-            capture_output=True,
-            text=True,
-            check=True
+            error_msg=f"Error enabling addon on {cluster_name}",
         )
-        
+
         click.echo(f"  ✅ Azure Key Vault Secrets Provider addon enabled successfully")
 
 
@@ -93,15 +89,13 @@ def _fetch_identity_id(aks_code: str, aks_env: str) -> str:
     kube_cluster = f"{aks_env}d9{aks_code}aks01"
     
     click.echo(f"Fetching identity ID from AKS cluster: {kube_cluster}...")
-    result = subprocess.run(
-        ["az", "aks", "show", 
+    result = run_cmd(
+        ["az", "aks", "show",
          "--resource-group", resource_group,
          "--name", kube_cluster,
          "--query", "addonProfiles.azureKeyvaultSecretsProvider.identity.clientId",
          "-o", "tsv"],
-        capture_output=True,
-        text=True,
-        check=True
+        error_msg=f"Error fetching identity ID from {kube_cluster}",
     )
     identity_id = result.stdout.strip()
     
@@ -115,11 +109,9 @@ def _fetch_identity_id(aks_code: str, aks_env: str) -> str:
 
 def _get_identity_object_id(client_id: str) -> str:
     """Get the object ID of a managed identity from its client ID."""
-    result = subprocess.run(
+    result = run_cmd(
         ["az", "ad", "sp", "show", "--id", client_id, "--query", "id", "-o", "tsv"],
-        capture_output=True,
-        text=True,
-        check=True
+        error_msg=f"Error fetching object ID for client ID {client_id}",
     )
     object_id = result.stdout.strip()
     
@@ -132,14 +124,12 @@ def _get_identity_object_id(client_id: str) -> str:
 
 def _check_keyvault_access(keyvault_name: str, object_id: str) -> bool:
     """Check if an identity has access policies configured for a Key Vault."""
-    result = subprocess.run(
-        ["az", "keyvault", "show", 
+    result = run_cmd(
+        ["az", "keyvault", "show",
          "--name", keyvault_name,
          "--query", f"properties.accessPolicies[?objectId=='{object_id}']",
          "-o", "json"],
-        capture_output=True,
-        text=True,
-        check=True
+        error_msg=f"Error fetching access policies for {keyvault_name}",
     )
     
     access_policies = json.loads(result.stdout)
@@ -162,7 +152,7 @@ def _grant_keyvault_access(keyvault_name: str, object_id: str, include_certifica
             "--key-permissions", "get", "list"
         ])
     
-    subprocess.run(cmd, capture_output=True, text=True, check=True)
+    run_cmd(cmd, error_msg=f"Error granting access to {keyvault_name}")
     click.echo(f"  ✅ Access granted to {keyvault_name}")
 
 
@@ -197,11 +187,9 @@ def _fetch_keyvault_secrets(keyvault_name: str, secrets_filter: Optional[tuple] 
     """Fetch secrets from a Key Vault, optionally filtering to specific secrets."""
     click.echo(f"Fetching secrets from Key Vault: {keyvault_name}...")
     
-    result = subprocess.run(
+    result = run_cmd(
         ["az", "keyvault", "secret", "list", "--vault-name", keyvault_name, "--query", "[].name", "-o", "json"],
-        capture_output=True,
-        text=True,
-        check=True
+        error_msg=f"Error listing secrets in {keyvault_name}",
     )
     
     all_secrets = json.loads(result.stdout)
@@ -809,40 +797,38 @@ def _backup_and_delete_existing_secrets(
     for secret_name in secret_names:
         try:
             # Check if secret exists
-            result = subprocess.run(
+            result = run_cmd(
                 ["kubectl", "get", "secret", secret_name, "-n", namespace, "-o", "json"],
-                capture_output=True,
-                text=True
+                check=False,
             )
-            
+
             if result.returncode == 0:
                 # Secret exists - backup and delete it
                 click.echo(f"⚠️  Found existing secret: {secret_name}")
-                
+
                 # Parse the secret manifest
                 secret_manifest = json.loads(result.stdout)
-                
+
                 # Create backup directory if needed
                 backup_dir.mkdir(parents=True, exist_ok=True)
-                
+
                 # Generate backup filename with timestamp
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 backup_filename = f"{secret_name}_{timestamp}.yaml"
                 backup_path = backup_dir / backup_filename
-                
+
                 # Write backup
                 with open(backup_path, 'w') as f:
                     yaml.dump(secret_manifest, f, default_flow_style=False)
-                
+
                 click.echo(f"  ✓ Backed up to: {backup_path}")
-                
+
                 # Delete the secret
-                delete_result = subprocess.run(
+                delete_result = run_cmd(
                     ["kubectl", "delete", "secret", secret_name, "-n", namespace],
-                    capture_output=True,
-                    text=True
+                    check=False,
                 )
-                
+
                 if delete_result.returncode == 0:
                     click.echo(f"  ✓ Deleted existing secret: {secret_name}")
                 else:
@@ -850,7 +836,7 @@ def _backup_and_delete_existing_secrets(
             else:
                 # Secret doesn't exist - nothing to do
                 click.echo(f"✓ No existing secret found: {secret_name}")
-                
+
         except Exception as e:
             click.echo(f"Warning: Error checking secret {secret_name}: {e}", err=True)
             # Continue with other secrets

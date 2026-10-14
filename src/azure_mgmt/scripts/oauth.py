@@ -3,7 +3,7 @@
 import click
 import json
 
-from helpers.env_config import require_environments
+from helpers.config import require_config
 from helpers.shell import run_cmd, run_cmd_or_dry
 from helpers.auth import elevated_spn
 
@@ -143,8 +143,13 @@ def setup_oauth(
     if not plans:
         return
 
+    client_id = require_config("cicd_spn_client_id")
+    tenant_id = require_config("tenant_id")
+    keyvault_name = require_config("cicd_spn_keyvault")
+    secret_name = require_config("cicd_spn_secret_name")
+
     # Write phase (elevated as the CICD SPN; permissions lowered on exit).
-    with elevated_spn(dry_run=dry_run):
+    with elevated_spn(client_id, tenant_id, keyvault_name, secret_name, dry_run=dry_run):
         for plan in plans:
             app_id, app_name = plan["app_id"], plan["app_name"]
             app_sp_id, graph_sp_id = plan["app_sp_id"], plan["graph_sp_id"]
