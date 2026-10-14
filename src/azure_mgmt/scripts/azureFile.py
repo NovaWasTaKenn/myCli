@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-from helpers.env_config import AKVAKS_SETUP_CICD_SPN_SECRET
+from helpers.config import require_config
 
 @click.group()
 def azureFile():
@@ -26,7 +26,7 @@ def _cicd_spn_login():
     click.echo("Logging in as cicd spn for elevated permissions")
     tenant_id = "ebaeb74c-eeae-40f8-b755-10b0e2bf7528"
     client_id = "0cc19a4c-bf76-4723-a014-f1111f501ce1"
-    secret = AKVAKS_SETUP_CICD_SPN_SECRET
+    secret = require_config("akvaks_setup_cicd_spn_secret")
 
     cmd = ["az", "login", "--service-principal", "--username", client_id, "--tenant", tenant_id, "-p", secret]
     subprocess.run(cmd)

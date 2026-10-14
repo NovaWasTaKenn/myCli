@@ -11,7 +11,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
-from helpers.env_config import require_environments
+from helpers.config import require_config
 
 
 # Dictionary mapping SPN types to naming patterns
@@ -80,7 +80,7 @@ def renew_secret(
         # Store both secret and appId for multiple environments
         mycli azure spn renew-secret 1381 datalake --env d --env t --store-appid
     """
-    environments_dict = require_environments()
+    environments_dict = require_config("azure_environments")
     
     # Default to all environments if none specified
     if len(environments) < 1:
@@ -115,7 +115,7 @@ def renew_secret(
     # Process each environment
     for env in environments:
         click.secho(f"\n{'='*70}", fg="magenta", bold=True)
-        click.secho(f"🌍 Processing Environment: {env.upper()} ({environments_dict[env][0]})", fg="magenta", bold=True)
+        click.secho(f"🌍 Processing Environment: {env.upper()} ({environments_dict[env]["name"]})", fg="magenta", bold=True)
         click.secho(f"{'='*70}", fg="magenta", bold=True)
         
         # Derive SPN and Key Vault names
@@ -128,9 +128,9 @@ def renew_secret(
         click.secho(f"🔒 Secret Name: {secret_name}", fg="white", bold=True)
         
         # Set subscription for this environment
-        subscription_id = environments_dict[env][1]
+        subscription_id = environments_dict[env]["subscription_id"]
         if not dry_run:
-            click.secho(f"\n🔧 Setting subscription to {environments_dict[env][0]} ({subscription_id})...", fg="yellow")
+            click.secho(f"\n🔧 Setting subscription to {environments_dict[env]["name"]} ({subscription_id})...", fg="yellow")
             try:
                 subprocess.run(
                     ["az", "account", "set", "--subscription", subscription_id],

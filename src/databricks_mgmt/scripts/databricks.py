@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 
 import click
 
-from helpers.env_config import require_environments
+from helpers.config import require_config
 
 DEFAULT_HOST = "https://accounts.azuredatabricks.net"
 PATCH_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:PatchOp"
@@ -309,7 +309,7 @@ def mount_blob(
     Example:
         mycli databricks mount-blob 'Mount blob {environment}' d90021sa01 mycontainer mydata d91231 --envs d --envs t
     """
-    environments = require_environments()
+    environments = require_config("azure_environments")
 
 
     storage_account_suffix = _strip_environment_prefix(storage_account)
@@ -382,7 +382,7 @@ def mount_datalake(
     Example:
         mycli databricks mount-datalake 'Mount datalake {environment}' d90021adl01 myfs mydata myproj --envs d --envs t
     """
-    environments = require_environments()
+    environments = require_config("azure_environments")
     host, token = _resolve_connection(profile)
     datalake_suffix = _strip_environment_prefix(datalake)
     job_name = "Job_Mount_Datalake_Serverless"
@@ -396,7 +396,7 @@ def mount_datalake(
         if env_short not in environments:
             click.secho(f"❌ Unknown environment prefix '{env_short}' — skipping", fg="red", err=True)
             continue
-        env_display = environments[env_short][0]
+        env_display = environments[env_short]["name"]
         job_id = _find_job_id(host, token, job_name)
         datalake_name = f"{env_short}{datalake_suffix}"
         click.secho(f"\n🌍 {env_short.upper()} ({env_display})", fg="magenta", bold=True)

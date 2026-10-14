@@ -1,38 +1,11 @@
 import click
 import subprocess
 import os
-from pathlib import Path
-
-from dotenv import set_key
 
 
 @click.group
 def config():
     pass
-
-
-@config.command()
-@click.argument("settings", nargs=-1, required=True, metavar="KEY=VALUE...")
-def configure(settings: tuple[str, ...]) -> None:
-    """Store SETTINGS in the CLI configuration file."""
-    values = {}
-    for setting in settings:
-        if "=" not in setting:
-            raise click.BadParameter(f"Expected KEY=VALUE, got '{setting}'", param_hint="settings")
-        key, value = setting.split("=", 1)
-        key = key.strip()
-        if not key:
-            raise click.BadParameter("Configuration keys cannot be empty", param_hint="settings")
-        values[key] = value
-
-    config_path = Path.home() / ".config" / "nova-cli" / ".env"
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.touch(mode=0o600, exist_ok=True)
-    for key, value in values.items():
-        set_key(str(config_path), key, value, quote_mode="auto")
-    config_path.chmod(0o600)
-
-    click.secho(f"Configured {', '.join(values)} in {config_path}", fg="green")
 
 
 @config.command()

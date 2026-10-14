@@ -30,10 +30,12 @@ import json
 import yaml
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
-import os
 
 from .utils import format_objects_array
-from helpers.env_config import MULTI_KV_CODE, SOCLE_KV_CODE, AKVAKS_SETUP_CICD_SPN_SECRET
+from helpers.config import require_config
+
+MULTI_KV_CODE = require_config("multi_kv_code")
+SOCLE_KV_CODE = require_config("socle_kv_code")
 from datetime import datetime
 
 

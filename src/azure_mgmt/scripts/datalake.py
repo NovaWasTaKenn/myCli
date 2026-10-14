@@ -4,7 +4,7 @@ import click
 import subprocess
 from datetime import datetime, timedelta, timezone
 
-from helpers.env_config import require_environments, require_ingestion_root_folders
+from helpers.config import require_config
 from helpers.shell import run_cmd, run_cmd_or_dry
 
 
@@ -49,13 +49,13 @@ def set_project_groups_acls(
             --environments d t \\
             --root-folders bronze silver gold
     """
-    environments_dict = require_environments()
+    environments_dict = require_config("azure_environments")
 
     if len(environments)<1: 
         environments = ("d", "t", "r", "p")
 
     if len(root_folders)<1 and not no_root_folder: 
-        root_folders = require_ingestion_root_folders()
+        root_folders = require_config("ingestion_root_folders")
 
     if no_root_folder: 
         root_folders = ["none"]
@@ -74,12 +74,12 @@ def set_project_groups_acls(
     # Process each environment
     for env in environments:
         click.secho(f"\n{'='*60}", fg="magenta", bold=True)
-        click.secho(f"🌍 Processing Environment: {env.upper()} ({environments_dict[env][0]})", fg="magenta", bold=True)
+        click.secho(f"🌍 Processing Environment: {env.upper()} ({environments_dict[env]["name"]})", fg="magenta", bold=True)
         click.secho(f"{'='*60}", fg="magenta", bold=True)
         
         # Set subscription for this environment
-        subscription_id = environments_dict[env][1]
-        click.secho(f"🔧 Setting subscription to {environments_dict[env][0]} ({subscription_id})...", fg="yellow")
+        subscription_id = environments_dict[env]["subscription_id"]
+        click.secho(f"🔧 Setting subscription to {environments_dict[env]["name"]} ({subscription_id})...", fg="yellow")
         run_cmd_or_dry(
             ["az", "account", "set", "--subscription", subscription_id],
             dry_run=dry_run,
@@ -93,8 +93,8 @@ def set_project_groups_acls(
         filesystem = f"{env}d9{sa_code}fs01" 
         
         # Derive group names from project name
-        contributors_name = f"GR_SEC_DATALAB_AZU_C-{environments_dict[env][0]}-{project_group_name}"
-        readers_name = f"GR_SEC_DATALAB_AZU_R-{environments_dict[env][0]}-{project_group_name}"
+        contributors_name = f"GR_SEC_DATALAB_AZU_C-{environments_dict[env]["name"]}-{project_group_name}"
+        readers_name = f"GR_SEC_DATALAB_AZU_R-{environments_dict[env]["name"]}-{project_group_name}"
         
         click.secho(f"📦 Project: {project_group_name}", fg="cyan", bold=True)
         click.secho(f"  👥 Contributors: {contributors_name}", fg="cyan")
@@ -253,8 +253,8 @@ def create_ingestion_folders(
     """
 
     sa_code = "0021"
-    root_folders = require_ingestion_root_folders()
-    environments_dict = require_environments()
+    root_folders = require_config("ingestion_root_folders")
+    environments_dict = require_config("azure_environments")
 
     if len(environments) < 1:
         environments = ("d", "t", "r", "p")
@@ -274,12 +274,12 @@ def create_ingestion_folders(
     # Process each environment
     for env in environments:
         click.secho(f"\n{'='*60}", fg="magenta", bold=True)
-        click.secho(f"🌍 Processing Environment: {env.upper()} ({environments_dict[env][0]})", fg="magenta", bold=True)
+        click.secho(f"🌍 Processing Environment: {env.upper()} ({environments_dict[env]["name"]})", fg="magenta", bold=True)
         click.secho(f"{'='*60}", fg="magenta", bold=True)
         
         # Set subscription for this environment
-        subscription_id = environments_dict[env][1]
-        click.secho(f"🔧 Setting subscription to {environments_dict[env][0]} ({subscription_id})...", fg="yellow")
+        subscription_id = environments_dict[env]["subscription_id"]
+        click.secho(f"🔧 Setting subscription to {environments_dict[env]["name"]} ({subscription_id})...", fg="yellow")
         run_cmd_or_dry(
             ["az", "account", "set", "--subscription", subscription_id],
             dry_run=dry_run,
@@ -368,7 +368,7 @@ def _setup_blob_container_for_env(
 
     sa_code = storage_account_name[-2:]
     env_short = storage_account_name[0]
-    env = require_environments()[env_short][0]
+    env = require_config("azure_environments")[env_short]["name"]
 
     if policy_name is None:
         policy_name = f"ap{sa_code}-{container_name}"
@@ -558,7 +558,7 @@ def setup_blob_container(
     STORAGE_ACCOUNT_NAME may omit the environment prefix or include one that will
     be replaced. For example, d90021sa01 targets dd90021sa01 in development.
     """
-    environments = require_environments()
+    environments = require_config("azure_environments")
     invalid_envs = [env for env in envs if env not in environments]
     if invalid_envs:
         raise click.ClickException(f"Unsupported environment prefix(es): {', '.join(invalid_envs)}")
@@ -566,7 +566,8 @@ def setup_blob_container(
     storage_account_suffix = _strip_environment_prefix(storage_account_name)
 
     for env_short in envs:
-        env_name, subscription_id = environments[env_short]
+        env_cfg = environments[env_short]
+        env_name, subscription_id = env_cfg["name"], env_cfg["subscription_id"]
         account_name = f"{env_short}{storage_account_suffix}"
 
         click.secho(f"\n{'='*60}", fg="magenta", bold=True)

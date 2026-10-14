@@ -5,7 +5,7 @@ import subprocess
 import json
 from typing import List, Optional
 
-from helpers.env_config import require_environments
+from helpers.config import require_config
 
 GRAPH_APP_ID = "00000003-0000-0000-c000-000000000000"
 DEFAULT_PERMISSIONS = [
@@ -56,7 +56,7 @@ def setup_oauth(
         mycli azure setup-oauth 138101 --env d --dry-run
         mycli azure setup-oauth 138101 -i 02 -e d -e t -p Mail.Read -r https://my.app
     """
-    environments_dict = require_environments()
+    environments_dict = require_config("azure_environments")
     if not environments:
         environments = ("d", "t", "r", "p")
 
@@ -80,7 +80,7 @@ def setup_oauth(
         wanted_urls = list(dict.fromkeys(_with_suffix(b, callback_suffix) for b in bases))
 
         click.secho(f"\n{'=' * 70}", fg="magenta", bold=True)
-        click.secho(f"🌍 {env.upper()} ({environments_dict[env][0]}) - app '{app_name}'", fg="magenta", bold=True)
+        click.secho(f"🌍 {env.upper()} ({environments_dict[env]["name"]}) - app '{app_name}'", fg="magenta", bold=True)
         click.secho(f"{'=' * 70}", fg="magenta", bold=True)
         click.echo(f"Permissions: {', '.join(wanted)}")
         click.echo("Redirect URLs:\n  " + "\n  ".join(wanted_urls))
@@ -90,7 +90,7 @@ def setup_oauth(
             continue
 
         try:
-            _az(["account", "set", "--subscription", environments_dict[env][1]])
+            _az(["account", "set", "--subscription", environments_dict[env]["subscription_id"]])
 
             apps = json.loads(_az(["ad", "app", "list", "--display-name", app_name,
                                    "--query", "[].{appId:appId,id:id}", "-o", "json"]))

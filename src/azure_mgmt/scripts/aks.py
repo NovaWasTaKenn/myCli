@@ -19,7 +19,10 @@ from .aksAkv import (
     _write_manifests as _write_akv_manifests,
     _backup_and_delete_existing_secrets
 )
-from helpers.env_config import MULTI_KV_CODE, SOCLE_KV_CODE
+from helpers.config import require_config
+
+MULTI_KV_CODE = require_config("multi_kv_code")
+SOCLE_KV_CODE = require_config("socle_kv_code")
 
 # Import helper functions from azureFile
 from .azureFile import (
@@ -146,14 +149,14 @@ def secretStore_csi_setup(
 
         if include_multi_kv and not MULTI_KV_CODE:
             click.echo(
-                "Error: MULTI_KV_CODE is not configured. Set it in .env or environment variables.",
+                "Error: multi_kv_code is not configured. Set it with `mycli configure multi_kv_code=<value>`.",
                 err=True,
             )
             raise click.Abort()
 
         if include_certificates_spc and not SOCLE_KV_CODE:
             click.echo(
-                "Error: SOCLE_KV_CODE is not configured. Set it in .env or environment variables.",
+                "Error: socle_kv_code is not configured. Set it with `mycli configure socle_kv_code=<value>`.",
                 err=True,
             )
             raise click.Abort()

@@ -31,7 +31,6 @@
         pkgs.python313Packages.azure-servicebus
         pkgs.python313Packages.jmespath
         pkgs.python313Packages.pyyaml
-        pkgs.python313Packages.python-dotenv
         pkgs.ripgrep
       ];
 
