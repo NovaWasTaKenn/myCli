@@ -1,219 +1,82 @@
 """Azure File CSI Driver commands."""
 
 import click
-import yaml
 import json
-from pathlib import Path
+
 from typing import Optional, Dict, Any, List
 
-from helpers.config import require_config
-from helpers.shell import run_cmd
+from helpers.auth import elevated_cicd_spn
+from helpers.shell import run_cmd, run_json, run_text
+from helpers.ui import banner
+
+from .utils import dump_manifests, write_output
+
+POOL_NAME_TAG = "aks-managed-poolName"
+SMB_ROLE = "Storage File Data SMB MI Admin"
 
 @click.group()
 def azureFile():
     """Azure File CSI Driver management commands"""
     pass
 
-def _cicd_spn_logout():
-
-    click.echo("Logging out as cicd spn")
-    run_cmd(["az", "logout"], error_msg="Error logging out", capture=False, check=False)
-
-
-def _cicd_spn_login():
-
-    click.echo("Logging in as cicd spn for elevated permissions")
-    tenant_id = "ebaeb74c-eeae-40f8-b755-10b0e2bf7528"
-    client_id = "0cc19a4c-bf76-4723-a014-f1111f501ce1"
-    secret = require_config("akvaks_setup_cicd_spn_secret")
-
-    run_cmd(
-        ["az", "login", "--service-principal", "--username", client_id, "--tenant", tenant_id, "-p", secret],
-        error_msg="Error logging in as cicd spn",
-        capture=False,
-    )
-
-def _check_managed_identity_exists(identity_name: str, resource_group: str) -> Optional[str]:
-    """Check if a managed identity exists and return its client ID."""
-    result = run_cmd(
-        ["az", "identity", "show",
-         "--name", identity_name,
-         "--resource-group", resource_group,
-         "--query", "clientId",
-         "-o", "tsv"],
+def _get_or_create_identity(identity_name: str, resource_group: str) -> Dict[str, str]:
+    """Return {clientId, id, principalId} of a managed identity, creating it if missing."""
+    query = ["--query", "{clientId:clientId,id:id,principalId:principalId}", "-o", "json"]
+    existing = run_cmd(
+        ["az", "identity", "show", "--name", identity_name, "--resource-group", resource_group, *query],
         check=False,
     )
+    if existing.returncode == 0 and existing.stdout.strip():
+        identity = json.loads(existing.stdout)
+        click.echo(f"  ✅ Managed identity exists with client ID: {identity['clientId']}")
+        return identity
 
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip()
-    return None
-
-
-def _create_managed_identity(identity_name: str, resource_group: str) -> str:
-    """Create a managed identity and return its client ID."""
     click.echo(f"  Creating managed identity: {identity_name}...")
-
-    result = run_cmd(
-        ["az", "identity", "create",
-         "--name", identity_name,
-         "--resource-group", resource_group,
-         "--query", "clientId",
-         "-o", "tsv"],
+    identity = run_json(
+        ["az", "identity", "create", "--name", identity_name, "--resource-group", resource_group, *query],
         error_msg=f"Error creating managed identity {identity_name}",
     )
+    click.echo(f"  ✅ Managed identity created with client ID: {identity['clientId']}")
+    return identity
 
-    client_id = result.stdout.strip()
-    click.echo(f"  ✅ Managed identity created with client ID: {client_id}")
-    return client_id
-
-
-def _get_aks_node_resource_group(aks_name: str, aks_resource_group: str) -> str:
-    """Get the AKS managed/node resource group."""
-    result = run_cmd(
-        ["az", "aks", "show",
-         "--name", aks_name,
-         "--resource-group", aks_resource_group,
-         "--query", "nodeResourceGroup",
-         "-o", "tsv"],
-        error_msg=f"Error getting node resource group for {aks_name}",
-    )
-
-    return result.stdout.strip()
-
-
-def _get_vmss_names_by_tag(node_resource_group: str, pool_name: str ) -> List[str]:
-    """Get all VMSS names that have the specified tag from the AKS node resource group."""
-    # Get all VMSS with their resource IDs
-    result = run_cmd(
+def _get_vmss_names_by_pool(node_resource_group: str, pool_name: str) -> List[str]:
+    """Return the VMSS of the node resource group tagged with the given AKS pool name."""
+    vmss_names = run_json(
         ["az", "vmss", "list",
          "--resource-group", node_resource_group,
-         "--query", "[].{name:name, id:id}",
+         "--query", f"[?tags.\"{POOL_NAME_TAG}\"=='{pool_name}'].name",
          "-o", "json"],
         error_msg=f"Error listing VMSS in {node_resource_group}",
-    )
-
-    vmss_list = json.loads(result.stdout)
-    tag_key = "aks-managed-poolName"
-    vmss_names = []
-
-    # Check tags for each VMSS
-    for vmss in vmss_list:
-        vmss_name = vmss["name"]
-        vmss_id = vmss["id"]
-
-        # Get tags for this VMSS using az tag list
-        tag_result = run_cmd(
-            ["az", "tag", "list",
-             "--resource-id", vmss_id,
-             "--query", "properties.tags",
-             "-o", "json"],
-            error_msg=f"Error listing tags for {vmss_id}",
-        )
-
-        tags = json.loads(tag_result.stdout) if tag_result.stdout.strip() else {}
-
-        # Check if VMSS has the aks-managed-poolname tag matching the pool name
-        if tags and tag_key in tags and tags[tag_key] == pool_name:
-            vmss_names.append(vmss_name)
-            click.echo(f"  Found VMSS: {vmss_name} (pool: {tags[tag_key]})")
-
-    if not vmss_names:
-        click.echo(f"  Warning: No VMSS found with tag '{tag_key}={pool_name}'", err=True)
-
-    return vmss_names
-
-
-def _get_identity_resource_id(identity_name: str, resource_group: str) -> str:
-    """Get the resource ID of a managed identity."""
-    result = run_cmd(
-        ["az", "identity", "show",
-         "--name", identity_name,
-         "--resource-group", resource_group,
-         "--query", "id",
-         "-o", "tsv"],
-        error_msg=f"Error getting resource ID of {identity_name}",
-    )
-
-    return result.stdout.strip()
-
-
-def _assign_identity_to_vmss_list(identity_resource_id: str, vmss_names: List[str], node_resource_group: str) -> None:
-    """Assign a managed identity to multiple VMSS."""
-    if not vmss_names:
-        click.echo("  ⚠️  No VMSS to assign identity to", err=True)
-        return
+    ) or []
 
     for vmss_name in vmss_names:
-        click.echo(f"  Assigning identity to VMSS: {vmss_name}...")
+        click.echo(f"  Found VMSS: {vmss_name} (pool: {pool_name})")
+    if not vmss_names:
+        click.echo(f"  ⚠️  No VMSS found with tag '{POOL_NAME_TAG}={pool_name}'", err=True)
+    return vmss_names
 
+def _assign_identity_to_vmss(identity_resource_id: str, vmss_names: List[str], node_resource_group: str) -> None:
+    for vmss_name in vmss_names:
+        click.echo(f"  Assigning identity to VMSS: {vmss_name}...")
         run_cmd(
             ["az", "vmss", "identity", "assign",
              "--identities", identity_resource_id,
              "--name", vmss_name,
              "--resource-group", node_resource_group],
             error_msg=f"Error assigning identity to VMSS {vmss_name}",
+            success_msg=f"Identity assigned to VMSS: {vmss_name}",
         )
 
-        click.echo(f"  ✅ Identity assigned to VMSS: {vmss_name}")
-
-
-def _check_role_assignment(principal_id: str, scope: str, role: str) -> bool:
-    """Check if a role assignment exists."""
-    result = run_cmd(
-        ["az", "role", "assignment", "list",
-         "--assignee", principal_id,
-         "--scope", scope,
-         "--role", role,
-         "--query", "[].id",
-         "-o", "tsv"],
-        error_msg=f"Error checking role assignment '{role}'",
-    )
-
-    return bool(result.stdout.strip())
-
-
-def _assign_role(principal_id: str, scope: str, role: str) -> None:
-    """Assign a role to a principal on a scope."""
-    click.echo(f"  Assigning role '{role}'...")
-
-    run_cmd(
-        ["az", "role", "assignment", "create",
-         "--assignee", principal_id,
-         "--role", role,
-         "--scope", scope],
-        error_msg=f"Error assigning role '{role}'",
-    )
-
-    click.echo(f"  ✅ Role assigned")
-
-
-def _get_identity_principal_id(identity_name: str, resource_group: str) -> str:
-    """Get the principal ID of a managed identity."""
-    result = run_cmd(
-        ["az", "identity", "show",
-         "--name", identity_name,
-         "--resource-group", resource_group,
-         "--query", "principalId",
-         "-o", "tsv"],
-        error_msg=f"Error getting principal ID of {identity_name}",
-    )
-
-    return result.stdout.strip()
-
-
-def _get_storage_account_id(storage_account: str, resource_group: str) -> str:
-    """Get the resource ID of a storage account."""
-    result = run_cmd(
-        ["az", "storage", "account", "show",
-         "--name", storage_account,
-         "--resource-group", resource_group,
-         "--query", "id",
-         "-o", "tsv"],
-        error_msg=f"Error getting resource ID of {storage_account}",
-    )
-
-    return result.stdout.strip()
-
+def _print_smb_manual_step(storage_account: str, storage_resource_group: str) -> None:
+    banner("⚠️  MANUAL STEP REQUIRED")
+    click.echo("Please enable 'Managed Identity for SMB' on the storage account:")
+    click.echo(f"  Storage Account: {storage_account}")
+    click.echo(f"  Resource Group: {storage_resource_group}")
+    click.echo("\nSteps:")
+    click.echo(f"  1. Go to Azure Portal > Storage Account > {storage_account}")
+    click.echo("  2. Navigate to Configuration")
+    click.echo("  3. Enable 'Managed Identity for SMB'")
+    click.echo("  4. Save changes")
 
 def _setup_infrastructure(
     env: str,
@@ -223,80 +86,57 @@ def _setup_infrastructure(
 ) -> str:
     """
     Set up the required infrastructure for Azure File CSI.
-    
+
     Returns the client ID of the managed identity.
     """
-    click.echo(f"\n{'='*60}")
-    click.echo("Setting up Azure File CSI infrastructure...")
-    click.echo(f"{'='*60}\n")
-    
-    # Resource names
+    banner("Setting up Azure File CSI infrastructure...")
+
     identity_name = f"azurefilecsi-{env}d9{aks_code}aks01"
     aks_name = f"{env}d9{aks_code}aks01"
     aks_resource_group = f"r400{env}d9{aks_code}"
     storage_account = f"{env}d9{adl_code}adl01"
     storage_resource_group = f"r400{env}d9{adl_code}"
-    
-    # 1. Get AKS node resource group (managed RG where identity should be)
-    click.echo(f"Getting AKS node resource group...")
-    node_resource_group = _get_aks_node_resource_group(aks_name, aks_resource_group)
-    click.echo(f"  Node resource group: {node_resource_group}")
-    
-    # 2. Check or create managed identity in the node resource group
-    click.echo(f"\nChecking managed identity: {identity_name}...")
-    client_id = _check_managed_identity_exists(identity_name, node_resource_group)
-    
-    if client_id:
-        click.echo(f"  ✅ Managed identity exists with client ID: {client_id}")
-    else:
-        client_id = _create_managed_identity(identity_name, node_resource_group)
-    
-    # 3. Get VMSS from pool
-    click.echo(f"\nGetting VMSS from pool {pool_name} ...")
-    vmss_names = _get_vmss_names_by_tag(node_resource_group, pool_name=pool_name)
-    
-    # 4. Assign identity to node pool VMSS
-    click.echo(f"\nAssigning identity to node pool VMSS...")
-    identity_resource_id = _get_identity_resource_id(identity_name, node_resource_group)
-    _assign_identity_to_vmss_list(identity_resource_id, vmss_names, node_resource_group)
-    
-    # 5. Manual step: Enable Managed Identity for SMB
-    click.echo(f"\n{'='*60}")
-    click.echo("⚠️  MANUAL STEP REQUIRED")
-    click.echo(f"{'='*60}")
-    click.echo(f"\nPlease enable 'Managed Identity for SMB' on the storage account:")
-    click.echo(f"  Storage Account: {storage_account}")
-    click.echo(f"  Resource Group: {storage_resource_group}")
-    click.echo(f"\nSteps:")
-    click.echo(f"  1. Go to Azure Portal > Storage Account > {storage_account}")
-    click.echo(f"  2. Navigate to Configuration")
-    click.echo(f"  3. Enable 'Managed Identity for SMB'")
-    click.echo(f"  4. Save changes")
-    
-    # 6. Assign RBAC role to storage account (requires elevated permissions)
-    click.echo(f"\n{'='*60}")
-    click.echo("Assigning RBAC role to storage account...")
-    click.echo(f"{'='*60}\n")
-    
-    principal_id = _get_identity_principal_id(identity_name, node_resource_group)
-    storage_account_id = _get_storage_account_id(storage_account, storage_resource_group)
-    role = "Storage File Data SMB MI Admin"
-    
-    # Login with CICD SPN for elevated permissions
-    _cicd_spn_login()
-    
-    try:
-        _assign_role(principal_id, storage_account_id, role)
-    finally:
-        # Always logout, even if role assignment fails
-        _cicd_spn_logout()
-    
-    click.echo(f"\n{'='*60}")
-    click.echo("✅ Infrastructure setup complete (except manual step 5 above)")
-    click.echo(f"{'='*60}\n")
-    
-    return client_id
 
+    # 1. AKS node resource group (managed RG where the identity lives)
+    click.echo("Getting AKS node resource group...")
+    node_resource_group = run_text(
+        ["az", "aks", "show", "--name", aks_name, "--resource-group", aks_resource_group,
+         "--query", "nodeResourceGroup", "-o", "tsv"],
+        error_msg=f"Error getting node resource group for {aks_name}",
+    )
+    click.echo(f"  Node resource group: {node_resource_group}")
+
+    # 2. Managed identity in the node resource group
+    click.echo(f"\nChecking managed identity: {identity_name}...")
+    identity = _get_or_create_identity(identity_name, node_resource_group)
+
+    # 3. Assign the identity to the node pool VMSS
+    click.echo(f"\nGetting VMSS from pool {pool_name}...")
+    vmss_names = _get_vmss_names_by_pool(node_resource_group, pool_name)
+    _assign_identity_to_vmss(identity["id"], vmss_names, node_resource_group)
+
+    # 4. Manual step: enable Managed Identity for SMB
+    _print_smb_manual_step(storage_account, storage_resource_group)
+
+    # 5. RBAC role on the storage account (requires elevated permissions)
+    banner("Assigning RBAC role to storage account...")
+    storage_account_id = run_text(
+        ["az", "storage", "account", "show", "--name", storage_account, "--resource-group", storage_resource_group,
+         "--query", "id", "-o", "tsv"],
+        error_msg=f"Error getting resource ID of {storage_account}",
+    )
+    with elevated_cicd_spn():
+        run_cmd(
+            ["az", "role", "assignment", "create",
+             "--assignee", identity["principalId"],
+             "--role", SMB_ROLE,
+             "--scope", storage_account_id],
+            error_msg=f"Error assigning role '{SMB_ROLE}'",
+            success_msg=f"Role '{SMB_ROLE}' assigned",
+        )
+
+    banner("✅ Infrastructure setup complete (except the manual step above)")
+    return identity["clientId"]
 
 def _generate_pvc(
     env: str,
@@ -323,7 +163,6 @@ def _generate_pvc(
             }
         }
     }
-
 
 def _generate_pv(
     env: str,
@@ -375,7 +214,6 @@ def _generate_pv(
         }
     }
 
-
 def _generate_storage_class(
     env: str,
     adl_code: str,
@@ -411,7 +249,6 @@ def _generate_storage_class(
         ]
     }
 
-
 def _write_manifests(
     manifests: List[Dict[str, Any]],
     output: Optional[str],
@@ -421,19 +258,9 @@ def _write_manifests(
     adl_code: str
 ) -> None:
     """Write manifests to file or stdout."""
-    yaml_output = "---\n".join([
-        yaml.dump(manifest, default_flow_style=False, sort_keys=False, width=4096, indent=2)
-        for manifest in manifests
-    ])
-    
-    if output:
-        output_path = Path(output).expanduser()
-        if output_path.is_dir() or not output_path.suffix:
-            output_path = output_path / f"{project_name}-{env}-{adl_code}-azurefile-csi.yaml"
-        
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(yaml_output)
-        click.echo(f"✅ Azure File CSI manifests written to: {output_path}")
-    else:
-        click.echo("\n" + yaml_output)
-
+    write_output(
+        dump_manifests(manifests),
+        output,
+        f"{project_name}-{env}-{adl_code}-azurefile-csi.yaml",
+        "Azure File CSI manifests",
+    )

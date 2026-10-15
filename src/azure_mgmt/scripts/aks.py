@@ -2,13 +2,14 @@
 
 import click
 import json
+import re
 import yaml
 from pathlib import Path
-from typing import Optional, List, Dict, Any
-from datetime import datetime
+from typing import Optional
 
-# Import helper functions from aksAkv
 from .aksAkv import (
+    MULTI_KV_CODE,
+    SOCLE_KV_CODE,
     _ensure_akv_addon_enabled,
     _fetch_identity_id,
     _ensure_keyvault_access,
@@ -16,15 +17,7 @@ from .aksAkv import (
     _generate_all_spcs,
     _generate_secret_keeper_pod,
     _write_manifests as _write_akv_manifests,
-    _backup_and_delete_existing_secrets
 )
-from helpers.config import require_config
-from helpers.shell import run_cmd
-
-MULTI_KV_CODE = require_config("multi_kv_code")
-SOCLE_KV_CODE = require_config("socle_kv_code")
-
-# Import helper functions from azureFile
 from .azureFile import (
     _setup_infrastructure,
     _generate_pvc,
@@ -32,6 +25,8 @@ from .azureFile import (
     _generate_storage_class,
     _write_manifests as _write_file_manifests,
 )
+from helpers.shell import run_cmd, run_text
+from helpers.ui import banner
 
 
 @click.group()
@@ -39,11 +34,22 @@ def aks():
     """AKS (Azure Kubernetes Service) management commands"""
     pass
 
+
+def _load_secret_objects_config(path: Optional[str]):
+    if not path:
+        return None
+    config_path = Path(path)
+    with open(config_path, 'r') as f:
+        mapping = yaml.safe_load(f) if config_path.suffix in ['.yaml', '.yml'] else json.load(f)
+    click.echo(f"Loaded secret objects configuration from: {path}")
+    return mapping
+
+
 @aks.command()
 @click.argument("keyvault-name", type=str)
 @click.option("--tenant-id", required=True, help="Azure tenant ID")
 @click.option("--identity-id", help="User assigned managed identity ID (auto-fetched from AKS if not provided)")
-@click.option("--aks-code", help="AKS project code (required if --identity-id not provided)")
+@click.option("--aks-code", required=True, help="AKS project code")
 @click.option("--namespace", default="default", help="Kubernetes namespace")
 @click.option("--project-name", help="Project name for resource naming (defaults to namespace)")
 @click.option("--output", "-o", type=click.Path(), help="Output directory or file path (defaults to stdout)")
@@ -54,12 +60,12 @@ def aks():
 @click.option("--secrets", multiple=True, help="Specific secrets to include (if not specified, all secrets will be included)")
 @click.option("--secret-objects-config", type=click.Path(exists=True), help="Path to YAML/JSON file mapping namespaces to multiple secret objects (see secret-objects-config.example.yaml)")
 @click.option("--separate-files", is_flag=True, help="Output SPCs and pod to separate files instead of combined YAML")
-@click.option("--cert-secret-name", help="Name of the kube secret for the certificates")
+@click.option("--cert-secret-name", default="ingress-tls", show_default=True, help="Name of the kube secret for the certificates")
 def secretStore_csi_setup(
     keyvault_name: str,
     tenant_id: str,
     identity_id: Optional[str],
-    aks_code: Optional[str],
+    aks_code: str,
     namespace: str,
     project_name: Optional[str],
     output: Optional[str],
@@ -70,7 +76,7 @@ def secretStore_csi_setup(
     secrets: tuple,
     secret_objects_config: Optional[str],
     separate_files: bool,
-    cert_secret_name: Optional[str]
+    cert_secret_name: str
 ):
     """
     Generate all Azure Key Vault manifests: SecretProviderClass(es) and secret-keeper Pod.
@@ -80,14 +86,14 @@ def secretStore_csi_setup(
 
     Examples:
         # Single keyvault
-        mycli aks generate-all name \\
+        mycli aks secretstore-csi-setup name \\
             --tenant-id <tenant-id> \\
             --aks-code code \\
             --namespace cfm \\
             --output manifests.yaml
 
         # Multiple keyvaults with separate files
-        mycli aks generate-all name \\
+        mycli aks secretstore-csi-setup name \\
             --include-multi-kv \\
             --tenant-id <tenant-id> \\
             --aks-code code \\
@@ -96,7 +102,7 @@ def secretStore_csi_setup(
             --separate-files
 
         # With custom project name (for long namespaces)
-        mycli aks generate-all name \\
+        mycli aks secretstore-csi-setup name \\
             --tenant-id <tenant-id> \\
             --aks-code code \\
             --namespace my-very-long-namespace-name \\
@@ -104,7 +110,7 @@ def secretStore_csi_setup(
             --output manifests.yaml
 
         # With multiple secret objects (using config file)
-        mycli aks generate-all name \\
+        mycli aks secretstore-csi-setup name \\
             --tenant-id <tenant-id> \\
             --aks-code code \\
             --namespace cfm \\
@@ -112,7 +118,7 @@ def secretStore_csi_setup(
             --output manifests.yaml
 
         # With TLS certificates
-        mycli aks generate-all name \\
+        mycli aks secretstore-csi-setup name \\
             --include-certificates-spc \\
             --cert-name my-ingress-cert \\
             --tenant-id <tenant-id> \\
@@ -120,98 +126,49 @@ def secretStore_csi_setup(
             --namespace cfm \\
             --output manifests.yaml
     """
-    # 1. Validate inputs and derive environment
-    aks_env = keyvault_name[0]
-
-
-    cert_secret_name = cert_secret_name if cert_secret_name else f"ingress-tls"
-
-    # Use project_name for naming, default to namespace if not provided
-    if not project_name:
-        project_name = namespace
-
-    # Load secret objects configuration if provided
-    secret_objects_mapping = None
-    if secret_objects_config:
-        config_path = Path(secret_objects_config)
-        with open(config_path, 'r') as f:
-            if config_path.suffix in ['.yaml', '.yml']:
-                secret_objects_mapping = yaml.safe_load(f)
-            else:
-                secret_objects_mapping = json.load(f)
-        click.echo(f"Loaded secret objects configuration from: {secret_objects_config}")
-
-    # 2. Validate that we have either identity_id or aks_code
-    if not aks_code:
-        click.echo("Error: --aks-code required", err=True)
-        raise click.Abort()
-
+    # 1. Validate inputs before touching Azure
     if include_multi_kv and not MULTI_KV_CODE:
-        click.echo(
-            "Error: multi_kv_code is not configured. Set it with `mycli configure multi_kv_code=<value>`.",
-            err=True,
-        )
-        raise click.Abort()
-
+        raise click.UsageError("multi_kv_code is not configured. Set it with `mycli configure multi_kv_code=<value>`.")
     if include_certificates_spc and not SOCLE_KV_CODE:
-        click.echo(
-            "Error: socle_kv_code is not configured. Set it with `mycli configure socle_kv_code=<value>`.",
-            err=True,
-        )
-        raise click.Abort()
+        raise click.UsageError("socle_kv_code is not configured. Set it with `mycli configure socle_kv_code=<value>`.")
+    if include_certificates_spc and not cert_name:
+        raise click.UsageError("--cert-name required with --include-certificates-spc")
+    if separate_files and not output:
+        raise click.UsageError("--output directory required with --separate-files")
 
-    # 3. Ensure Azure Key Vault Secrets Provider addon is enabled (if aks_code provided)
-    if aks_code:
-        _ensure_akv_addon_enabled(aks_code, aks_env)
+    aks_env = keyvault_name[0]
+    project_name = project_name or namespace
+    secret_objects_mapping = _load_secret_objects_config(secret_objects_config)
 
-    # 4. Fetch identity ID if not provided
-    if not identity_id:
-        identity_id = _fetch_identity_id(aks_code, aks_env)
+    # 2. AKS addon and its managed identity
+    _ensure_akv_addon_enabled(aks_code, aks_env)
+    identity_id = identity_id or _fetch_identity_id(aks_code, aks_env)
 
-    # 5. Build list of all keyvaults that need access
+    # 3. Grant the identity access to every keyvault it will read
     keyvaults_to_access = [keyvault_name]
-    cert_kv_name = None
-
     if include_multi_kv:
         keyvaults_to_access.append(f"{aks_env}d9{MULTI_KV_CODE}akv01")
-
-    if include_certificates_spc:
-        cert_kv_name = f"{aks_env}d9{SOCLE_KV_CODE}akv01"
+    cert_kv_name = f"{aks_env}d9{SOCLE_KV_CODE}akv01" if include_certificates_spc else None
+    if cert_kv_name:
         keyvaults_to_access.append(cert_kv_name)
+    _ensure_keyvault_access(keyvaults_to_access, identity_id, certificate_kv_name=cert_kv_name)
 
-    # 6. Ensure identity has access to all keyvaults
-    _ensure_keyvault_access(
-        keyvault_names=keyvaults_to_access,
-        identity_client_id=identity_id,
-        certificate_kv_name=cert_kv_name
-    )
-
-    # 7. Collect keyvault configurations (fetches secrets once)
-    click.echo(f"\n{'='*60}")
-    click.echo("Collecting keyvault configurations...")
-    click.echo(f"{'='*60}\n")
-
+    # 4. Collect the secrets of each keyvault
+    banner("Collecting keyvault configurations...")
     keyvaults_config = _collect_keyvault_configs(
         keyvault_name=keyvault_name,
         include_multi_kv=include_multi_kv,
         aks_env=aks_env,
         namespace=namespace,
         project_name=project_name,
-        secrets_filter=secrets if secrets else None,
+        secrets_filter=secrets or None,
         secret_objects_mapping=secret_objects_mapping
     )
-
-    click.echo(f"kv confi : {keyvaults_config}")
-
     if not keyvaults_config:
-        click.echo("Error: No keyvaults configured", err=True)
-        raise click.Abort()
+        raise click.ClickException("No keyvaults configured")
 
-    # 8. Generate all SecretProviderClass manifests
-    click.echo(f"\n{'='*60}")
-    click.echo("Generating SecretProviderClass manifests...")
-    click.echo(f"{'='*60}\n")
-
+    # 5. Generate the manifests
+    banner("Generating SecretProviderClass manifests...")
     spcs = _generate_all_spcs(
         keyvaults_config=keyvaults_config,
         identity_id=identity_id,
@@ -224,11 +181,7 @@ def secretStore_csi_setup(
         cert_kube_secret_name=cert_secret_name
     )
 
-    # 9. Generate secret-keeper deployment
-    click.echo(f"\n{'='*60}")
-    click.echo("Generating secret-keeper deployment...")
-    click.echo(f"{'='*60}\n")
-
+    banner("Generating secret-keeper deployment...")
     pod_manifest = _generate_secret_keeper_pod(
         pod_name=pod_name,
         namespace=namespace,
@@ -239,20 +192,8 @@ def secretStore_csi_setup(
         aks_env=aks_env
     )
 
-    # 10. Backup and delete existing secrets if they exist
-    # _backup_and_delete_existing_secrets(
-    #     keyvaults_config=keyvaults_config,
-    #     namespace=namespace,
-    #     include_certificates_spc=include_certificates_spc,
-    #     cert_kube_secret_name=cert_secret_name,
-    #     output=output
-    # )
-
-    # 11. Write outputs
-    click.echo(f"\n{'='*60}")
-    click.echo("Writing manifests...")
-    click.echo(f"{'='*60}\n")
-
+    # 6. Write outputs
+    banner("Writing manifests...")
     _write_akv_manifests(
         spcs=spcs,
         pod=pod_manifest,
@@ -268,7 +209,7 @@ def secretStore_csi_setup(
     click.echo("\nNext steps:")
     click.echo("  1. Review the generated manifests")
     click.echo("  2. Apply them to your cluster: kubectl apply -f <manifest-file>")
-    click.echo("  3. Verify the secret-keeper deployment is running: kubectl get deployment -n " + namespace)
+    click.echo(f"  3. Verify the secret-keeper deployment is running: kubectl get deployment -n {namespace}")
 
 
 @aks.command()
@@ -279,7 +220,7 @@ def secretStore_csi_setup(
 @click.option("--project-name", help="Project name for resource naming (defaults to namespace)")
 @click.option("--client-id", help="Azure File CSI driver managed identity client ID (auto-created if not provided)")
 @click.option("--setup-infrastructure", is_flag=True, help="Set up managed identity, VMSS assignment, and storage permissions")
-@click.option("--pool-name", help="Name of the node pool")
+@click.option("--pool-name", help="Name of the node pool (defaults to {namespace}pool)")
 @click.option("--output", "-o", type=click.Path(), help="Output file path (defaults to stdout)")
 def azurefile_csi_setup(
     adl_code: str,
@@ -301,12 +242,12 @@ def azurefile_csi_setup(
     With --setup-infrastructure, the command will:
     - Create or verify the azurefilecsi-{env}d9{aks-code}aks01 managed identity in the node RG
     - Assign it to the AKS VMSS with tag 'aks-managed-poolName' matching the pool name
-    - Display the command to assign 'Storage File Data SMB Share Elevated Contributor' role (requires elevated permissions)
+    - Assign the 'Storage File Data SMB MI Admin' role on the storage account (elevated as the CICD SPN)
     - Display instructions to manually enable 'Managed Identity for SMB' in Azure Portal
 
     Examples:
         # Set up infrastructure and generate manifests
-        mycli aks generate-csi-manifests code \\
+        mycli aks azurefile-csi-setup code \\
             --env env \\
             --aks-code code \\
             --namespace cfm \\
@@ -314,42 +255,27 @@ def azurefile_csi_setup(
             --setup-infrastructure \\
             --output ./k8s/
 
-        # Generate manifests with custom project name (for long namespaces)
-        mycli aks generate-csi-manifests code \\
+        # Generate manifests with existing identity and custom project name
+        mycli aks azurefile-csi-setup code \\
             --env env \\
             --aks-code code \\
             --namespace my-very-long-namespace-name \\
             --project-name cfm \\
             --client-id <azure-file-csi-umi-client-id> \\
             --output ./k8s/
-
-        # Generate manifests with existing identity
-        mycli aks generate-csi-manifests code \\
-            --env env \\
-            --aks-code code \\
-            --namespace cfm \\
-            --client-id <azure-file-csi-umi-client-id> \\
-            --output ./k8s/
     """
-    # Use project_name for naming, default to namespace if not provided
-    if not project_name:
-        project_name = namespace
+    if not setup_infrastructure and not client_id:
+        raise click.UsageError("--client-id is required when --setup-infrastructure is not used")
 
-    if not pool_name:
-        pool_name = f"{namespace}pool"
+    project_name = project_name or namespace
+    pool_name = pool_name or f"{namespace}pool"
 
-    # 1. Set up infrastructure if requested or get client ID
+    # 1. Infrastructure (managed identity, VMSS, RBAC)
     if setup_infrastructure:
         client_id = _setup_infrastructure(env, aks_code, adl_code, pool_name)
-    elif not client_id:
-        click.echo("Error: --client-id is required when --setup-infrastructure is not used", err=True)
-        raise click.Abort()
 
-    # 2. Generate manifests
-    click.echo(f"\n{'='*60}")
-    click.echo("Generating Azure File CSI Driver manifests...")
-    click.echo(f"{'='*60}\n")
-
+    # 2. Manifests
+    banner("Generating Azure File CSI Driver manifests...")
     click.echo(f"Environment: {env}")
     click.echo(f"ADL Code: {adl_code}")
     click.echo(f"Namespace: {namespace}")
@@ -363,16 +289,10 @@ def azurefile_csi_setup(
         _generate_pv(env, adl_code, namespace, project_name, client_id),
         _generate_storage_class(env, adl_code, namespace, client_id)
     ]
-
-    click.echo("✅ Generated PersistentVolumeClaim")
-    click.echo("✅ Generated PersistentVolume")
-    click.echo("✅ Generated StorageClass\n")
+    click.echo("✅ Generated PersistentVolumeClaim, PersistentVolume and StorageClass")
 
     # 3. Write outputs
-    click.echo(f"{'='*60}")
-    click.echo("Writing manifests...")
-    click.echo(f"{'='*60}\n")
-
+    banner("Writing manifests...")
     _write_file_manifests(
         manifests=manifests,
         output=output,
@@ -396,45 +316,29 @@ def kill_agent(name_suffix: str):
         # Delete agent pod with specific suffix
         mycli aks kill-agent my-agent-123
     """
-    import re
-
-    click.echo(f"Switching to cicd-agents context and deleting pods matching suffix :'{name_suffix}'...")
+    click.echo(f"Switching to cicd-agents context and deleting pods matching suffix: '{name_suffix}'...")
     run_cmd(
         ["kubectl", "config", "use-context", "cicd-agents"],
         error_msg="Error switching to cicd-agents context",
     )
 
     click.echo("Retrieving agent name")
-    pods_result = run_cmd(
-        ["kubectl", "get", "pods", "-o", "name"],
-        error_msg="Error listing pods",
-    )
-
-    all_pods = [line.strip() for line in pods_result.stdout.splitlines() if line.strip()]
+    pods = run_text(["kubectl", "get", "pods", "-o", "name"], error_msg="Error listing pods").splitlines()
     pattern = re.compile(rf"^pod/azdevopswin-pipeline-d9.*{re.escape(name_suffix)}$")
-    matching_agents = [pod for pod in all_pods if pattern.match(pod)]
+    matching_agents = [pod.strip() for pod in pods if pattern.match(pod.strip())]
 
     if not matching_agents:
         click.echo(f"No agent with suffix {name_suffix} found")
         return
-
     if len(matching_agents) > 1:
-        click.echo(
-            f"Error: Multiple agents match suffix '{name_suffix}'. Please use a more specific suffix:",
-            err=True,
+        raise click.ClickException(
+            f"Multiple agents match suffix '{name_suffix}'. Please use a more specific suffix:\n"
+            + "\n".join(f"  - {pod}" for pod in matching_agents)
         )
-        for pod_name in matching_agents:
-            click.echo(f"  - {pod_name}", err=True)
-        raise click.Abort()
 
     agent_name = matching_agents[0]
     click.echo(f"Matched agent: {agent_name}")
-
-    delete_result = run_cmd(
-        ["kubectl", "delete", agent_name],
-        error_msg="Error deleting pod",
-    )
-    if delete_result.stdout:
-        click.echo(delete_result.stdout)
-
+    deleted = run_text(["kubectl", "delete", agent_name], error_msg="Error deleting pod")
+    if deleted:
+        click.echo(deleted)
     click.echo("✅ Pods deleted successfully!")

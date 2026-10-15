@@ -1,7 +1,10 @@
 import click
 import os
+from typing import List
 
 from helpers.shell import run_cmd
+
+DOTFILES = os.path.expanduser("~/.dotfiles/")
 
 
 @click.group
@@ -9,15 +12,49 @@ def config():
     pass
 
 
+def _run_steps(steps: List[List[str]]) -> None:
+    """Run commands in order, attached to the terminal, aborting on the first failure."""
+    for cmd in steps:
+        run_cmd(cmd, error_msg=f"{' '.join(cmd)} failed", capture=False)
+
+
+def _rebuild_cmd(base: List[str], flake_output: str, rollback: bool, update: bool, switch: bool) -> List[str]:
+    return (
+        [*base, "switch" if switch else "build", "--flake", f"{DOTFILES}#{flake_output}"]
+        + (["--rollback"] if rollback else [])
+        + (["--update"] if update else [])
+    )
+
+
+def _system_rebuild_cmd(rollback: bool, update: bool, switch: bool) -> List[str]:
+    return _rebuild_cmd(["sudo", "nixos-rebuild"], "system", rollback, update, switch)
+
+
+def _user_rebuild_cmd(rollback: bool, update: bool, switch: bool) -> List[str]:
+    return _rebuild_cmd(["home-manager"], "user", rollback, update, switch)
+
+
+def rebuild_options(update_help: str):
+    """Shared --rollback/--update/--switch options of the rebuild commands."""
+    def decorator(f):
+        f = click.option("--switch/--no-switch", default=False, help="Switch to the newly built config")(f)
+        f = click.option("--update/--no-update", default=False, help=update_help)(f)
+        f = click.option("--rollback/--no-rollback", default=False, help="Rollback to previous version")(f)
+        return f
+    return decorator
+
+
 @config.command()
 def system_clean():
     """Clean up old nix generations and optimize the store."""
-    run_cmd("sudo nix-collect-garbage -d".split(), error_msg="nix-collect-garbage failed", capture=False)
-    run_cmd("home-manager expire-generations -d".split(), error_msg="expire-generations failed", capture=False)
-    run_cmd("nix store gc".split(), error_msg="nix store gc failed", capture=False)
-    run_cmd("sudo nix store optimize".split(), error_msg="nix store optimize failed", capture=False)
-    run_cmd("sudo nix profile wipe-history".split(), error_msg="nix profile wipe-history failed", capture=False)
-    run_cmd("home-manager remove-generations old".split(), error_msg="remove-generations failed", capture=False)
+    _run_steps([
+        ["sudo", "nix-collect-garbage", "-d"],
+        ["home-manager", "expire-generations", "-d"],
+        ["nix", "store", "gc"],
+        ["sudo", "nix", "store", "optimize"],
+        ["sudo", "nix", "profile", "wipe-history"],
+        ["home-manager", "remove-generations", "old"],
+    ])
 
 
 @config.command()
@@ -30,19 +67,7 @@ def system_clean():
 )
 def update(flakeinput: str, flakepath: str):
     """Command that update a flake's input. By default updates the config's main flake"""
-
-    run_cmd(
-        [
-            "nix",
-            "flake",
-            "update",
-            flakeinput,
-            "--flake",
-            os.path.expanduser(flakepath),
-        ],
-        error_msg="nix flake update failed",
-        capture=False,
-    )
+    _run_steps([["nix", "flake", "update", flakeinput, "--flake", os.path.expanduser(flakepath)]])
 
 
 @config.command()
@@ -54,155 +79,32 @@ def update(flakeinput: str, flakepath: str):
 )
 def reload(flakeinput: str, packagename: str):
     """Command that builds packageName package, updates the inputFlakeName flake input in the config and rebuilds the home config to reload the changes"""
-
-    packagename = (
-        packagename if (packagename != "" and packagename is not None) else flakeinput
-    )
-
-    run_cmd(["nix", "build", f"./#{packagename}"], error_msg="nix build failed", capture=False)
-
-    run_cmd(
-        [
-            "nix",
-            "flake",
-            "update",
-            flakeinput,
-            "--flake",
-            os.path.expanduser("~/.dotfiles/"),
-        ],
-        error_msg="nix flake update failed",
-        capture=False,
-    )
-
-    run_cmd(
-        [
-            "home-manager",
-            "switch",
-            "--flake",
-            os.path.expanduser("~/.dotfiles/#user"),
-        ],
-        error_msg="home-manager switch failed",
-        capture=False,
-    )
+    _run_steps([
+        ["nix", "build", f"./#{packagename or flakeinput}"],
+        ["nix", "flake", "update", flakeinput, "--flake", DOTFILES],
+        ["home-manager", "switch", "--flake", f"{DOTFILES}#user"],
+    ])
 
 
 @config.command()
-@click.option(
-    "--rollback/--no-rollback",
-    default=False,
-    help="Rollback to previous version",
-    type=bool,
-)
-@click.option(
-    "--update/--no-update",
-    default=False,
-    help="Update inputs before rebuild",
-    type=bool,
-)
-@click.option(
-    "--switch/--no-switch",
-    default=False,
-    help="Do not switch to newly built config",
-    type=bool,
-)
+@rebuild_options("Update inputs before rebuild")
 def rebuild_user(rollback: bool, update: bool, switch: bool):
     """Command that rebuilds the current user home-manager config"""
-
-    args: list[str] = (
-        [
-            "home-manager",
-            "switch" if switch else "build",
-            "--flake",
-            os.path.expanduser("~/.dotfiles/#user"),
-        ]
-        + (["--rollback"] if rollback else [])
-        + (["--update"] if update else [])
-    )
-
-    run_cmd(args, error_msg="home-manager rebuild failed", capture=False)
+    _run_steps([_user_rebuild_cmd(rollback, update, switch)])
 
 
 @config.command()
-@click.option(
-    "--rollback/--no-update",
-    default=False,
-    help="Rollback to previous version",
-    type=bool,
-)
-@click.option(
-    "--update/--no-update",
-    default=False,
-    help="Update inputs before config",
-    type=bool,
-)
-@click.option(
-    "--switch/--no-switch",
-    default=False,
-    help="Do not switch to newly built config",
-    type=bool,
-)
+@rebuild_options("Update inputs before config")
 def rebuild_system(rollback: bool, update: bool, switch: bool):
     """Command that rebuilds the system config"""
-
-    args: list[str] = (
-        [
-            "sudo",
-            "nixos-rebuild",
-            "switch" if switch else "build",
-            "--flake",
-            os.path.expanduser("~/.dotfiles/#system"),
-        ]
-        + (["--rollback"] if rollback else [])
-        + (["--update"] if update else [])
-    )
-    run_cmd(args, error_msg="nixos-rebuild failed", capture=False)
+    _run_steps([_system_rebuild_cmd(rollback, update, switch)])
 
 
 @config.command()
-@click.option(
-    "--rollback/--no-update",
-    default=False,
-    help="Rollback to previous version",
-    type=bool,
-)
-@click.option(
-    "--update/--no-update",
-    default=False,
-    help="Update inputs before rebuild",
-    type=bool,
-)
-@click.option(
-    "--switch/--no-switch",
-    default=False,
-    help="Do not switch to newly built config",
-    type=bool,
-)
+@rebuild_options("Update inputs before rebuild")
 def rebuild_all(rollback: bool, update: bool, switch: bool):
     """Command that rebuilds the system and user configs"""
-
-    system_args: list[str] = (
-        [
-            "sudo",
-            "nixos-rebuild",
-            "switch" if switch else "build",
-            "--flake",
-            os.path.expanduser("~/.dotfiles/#system"),
-        ]
-        + (["--rollback"] if rollback else [])
-        + (["--update"] if update else [])
-    )
-
-    user_args: list[str] = (
-        [
-            "home-manager",
-            "switch" if switch else "build",
-            "--flake",
-            os.path.expanduser("~/.dotfiles/#user"),
-        ]
-        + (["--rollback"] if rollback else [])
-        + (["--update"] if update else [])
-    )
-
-    run_cmd(system_args, error_msg="nixos-rebuild failed", capture=False)
-
-    run_cmd(user_args, error_msg="home-manager rebuild failed", capture=False)
+    _run_steps([
+        _system_rebuild_cmd(rollback, update, switch),
+        _user_rebuild_cmd(rollback, update, switch),
+    ])

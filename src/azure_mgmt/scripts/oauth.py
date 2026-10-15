@@ -2,12 +2,15 @@
 
 import click
 import json
+from typing import Any, Dict, List, Optional
 
-from helpers.config import require_config
-from helpers.shell import run_cmd, run_cmd_or_dry
-from helpers.auth import elevated_spn
+from helpers.auth import elevated_cicd_spn
+from helpers.azure import resolve_environments, set_subscription
+from helpers.shell import run_cmd_or_dry, run_json, run_text
+from helpers.ui import banner
 
 GRAPH_APP_ID = "00000003-0000-0000-c000-000000000000"
+GRAPH_URL = "https://graph.microsoft.com/v1.0"
 DEFAULT_PERMISSIONS = [
     "offline_access", "openid", "profile", "User.Read",
     "GroupMember.Read.All", "email",
@@ -19,6 +22,121 @@ LOCAL_ENV = "d"
 def _with_suffix(url: str, suffix: str) -> str:
     url = url.rstrip("/")
     return url if url.endswith(suffix) else f"{url}/{suffix}"
+
+
+def _wanted_redirect_urls(env: str, webapp_url: str, extra_urls: tuple, callback_suffix: str) -> List[str]:
+    bases = [webapp_url, *(LOCAL_REDIRECT_BASES if env == LOCAL_ENV else []), *extra_urls]
+    return list(dict.fromkeys(_with_suffix(b, callback_suffix) for b in bases))
+
+
+def _plan_env(
+    env: str,
+    env_cfg: Dict[str, Any],
+    app_name: str,
+    wanted: List[str],
+    wanted_urls: List[str],
+) -> Optional[Dict[str, Any]]:
+    """Read phase for one env (as the current user): gather what the writes need."""
+    set_subscription(env_cfg)
+
+    apps = run_json(
+        ["az", "ad", "app", "list", "--display-name", app_name,
+         "--query", "[].{appId:appId,id:id}", "-o", "json"],
+        error_msg=f"Error listing app '{app_name}'",
+    )
+    if not apps:
+        click.secho(f"❌ app '{app_name}' not found, skipping", fg="red", err=True)
+        return None
+    app_id = apps[0]["appId"]
+
+    graph_sp = run_json(
+        ["az", "ad", "sp", "show", "--id", GRAPH_APP_ID,
+         "--query", "{id:id,scopes:oauth2PermissionScopes[].{id:id,value:value}}", "-o", "json"],
+        error_msg="Error fetching Microsoft Graph service principal",
+    )
+    scope_ids = {s["value"]: s["id"] for s in graph_sp["scopes"]}
+    unknown = [p for p in wanted if p not in scope_ids]
+    if unknown:
+        click.secho(f"❌ Unknown Graph delegated permission(s): {', '.join(unknown)}", fg="red", err=True)
+        return None
+
+    app_sp_id = run_text(
+        ["az", "ad", "sp", "show", "--id", app_id, "--query", "id", "-o", "tsv"],
+        error_msg=f"Error fetching service principal for app '{app_name}'",
+    )
+
+    existing_urls = run_json(
+        ["az", "ad", "app", "show", "--id", app_id, "--query", "web.redirectUris", "-o", "json"],
+        error_msg="Error fetching current redirect URLs",
+    )
+
+    return {
+        "app_name": app_name,
+        "app_id": app_id,
+        "app_sp_id": app_sp_id,
+        "graph_sp_id": graph_sp["id"],
+        "scope_ids": scope_ids,
+        "redirect_urls": list(dict.fromkeys([*(existing_urls or []), *wanted_urls])),
+    }
+
+
+def _add_permissions(plan: Dict[str, Any], wanted: List[str], dry_run: bool) -> None:
+    scope_ids = plan["scope_ids"]
+    run_cmd_or_dry(
+        ["az", "ad", "app", "permission", "add", "--id", plan["app_id"], "--api", GRAPH_APP_ID,
+         "--api-permissions", *(f"{scope_ids[p]}=Scope" for p in wanted)],
+        dry_run=dry_run,
+        dry_run_msg=(
+            f"Would add {len(wanted)} Graph delegated permission(s) on app {plan['app_id']} ({plan['app_name']})"
+            f" via API {GRAPH_APP_ID}:\n    "
+            + "\n    ".join(f"{p} ({scope_ids[p]}=Scope)" for p in wanted)
+        ),
+        error_msg="Error adding permissions",
+        success_msg="Permissions added",
+    )
+
+
+def _grant_admin_consent(plan: Dict[str, Any], wanted: List[str], dry_run: bool) -> None:
+    """Upsert the Graph oauth2PermissionGrant (the CLI's `admin-consent` rejects SPN tokens)."""
+    app_sp_id, graph_sp_id = plan["app_sp_id"], plan["graph_sp_id"]
+    grants = run_json(
+        ["az", "rest", "--method", "GET",
+         "--url", f"{GRAPH_URL}/servicePrincipals/{app_sp_id}/oauth2PermissionGrants"],
+        error_msg="Error reading existing admin consent grants",
+    ).get("value", [])
+    grant = next((g for g in grants if g.get("resourceId") == graph_sp_id), None)
+    scope = " ".join(dict.fromkeys([*(grant or {}).get("scope", "").split(), *wanted]))
+
+    if grant:
+        method, url, body = "PATCH", f"{GRAPH_URL}/oauth2PermissionGrants/{grant['id']}", {"scope": scope}
+        action = f"update admin consent grant {grant['id']}"
+    else:
+        method, url = "POST", f"{GRAPH_URL}/oauth2PermissionGrants"
+        body = {"clientId": app_sp_id, "consentType": "AllPrincipals", "resourceId": graph_sp_id, "scope": scope}
+        action = "grant admin consent"
+
+    run_cmd_or_dry(
+        ["az", "rest", "--method", method, "--url", url,
+         "--headers", "Content-Type=application/json", "--body", json.dumps(body)],
+        dry_run=dry_run,
+        dry_run_msg=f"Would {action} on SP {app_sp_id} ({plan['app_name']}) → scope: {scope}",
+        error_msg=f"Error trying to {action}",
+        success_msg=f"Admin consent {'updated' if grant else 'granted'}",
+    )
+
+
+def _update_redirect_urls(plan: Dict[str, Any], dry_run: bool) -> None:
+    urls = plan["redirect_urls"]
+    run_cmd_or_dry(
+        ["az", "ad", "app", "update", "--id", plan["app_id"], "--web-redirect-uris", *urls],
+        dry_run=dry_run,
+        dry_run_msg=(
+            f"Would set {len(urls)} redirect URI(s) on app {plan['app_id']} ({plan['app_name']}):\n    "
+            + "\n    ".join(urls)
+        ),
+        error_msg="Error updating redirect URLs",
+        success_msg="Redirect URLs updated",
+    )
 
 
 @click.command("setup-oauth")
@@ -53,175 +171,33 @@ def setup_oauth(
         mycli azure setup-oauth 1381 --env d --dry-run
         mycli azure setup-oauth 1381-i 02 -e d -e t -p Mail.Read -r https://my.app
     """
-    environments_dict = require_config("azure_environments")
-    if not environments:
-        environments = ("d", "t", "r", "p")
-
-    for env in environments:
-        if env not in environments_dict:
-            click.secho(f"❌ Environment prefix '{env}' not supported", fg="red", err=True)
-            click.secho(f"   Available: {', '.join(environments_dict.keys())}", fg="yellow", err=True)
-            raise click.Abort()
-
+    envs = resolve_environments(environments)
     wanted = list(dict.fromkeys([*DEFAULT_PERMISSIONS, *extra_permissions]))
+    webapp_code = webapp_code or extended_code
     if dry_run:
         click.secho("⚠️  DRY RUN MODE - No changes will be made", fg="yellow", bold=True)
 
-    webapp_code = webapp_code if webapp_code else extended_code
-
-    # Read phase (as the current user): gather everything the writes will need.
+    # Read phase (as the current user)
     plans = []
-    for env in environments:
+    for env, env_cfg in envs.items():
         app_name = f"{env}d9{extended_code}spnadl"
         webapp_url = f"https://{env}d9{webapp_code}webapp{increment}.azurewebsites.net"
-        bases = [webapp_url]
-        if env == LOCAL_ENV:
-            bases += LOCAL_REDIRECT_BASES
-        bases += list(extra_redirect_urls)
-        wanted_urls = list(dict.fromkeys(_with_suffix(b, callback_suffix) for b in bases))
+        wanted_urls = _wanted_redirect_urls(env, webapp_url, extra_redirect_urls, callback_suffix)
 
-        click.secho(f"\n{'=' * 70}", fg="magenta", bold=True)
-        click.secho(f"🌍 {env.upper()} ({environments_dict[env]["name"]}) - app '{app_name}'", fg="magenta", bold=True)
-        click.secho(f"{'=' * 70}", fg="magenta", bold=True)
+        banner(f"🌍 {env.upper()} ({env_cfg['name']}) - app '{app_name}'", fg="magenta", width=70)
         click.echo(f"Permissions: {', '.join(wanted)}")
         click.echo("Redirect URLs:\n  " + "\n  ".join(wanted_urls))
 
-        # Read: select subscription (no dry-run)
-        run_cmd(
-            ["az", "account", "set", "--subscription", environments_dict[env][1]],
-            error_msg="Error setting subscription",
-            capture=False,
-        )
-
-        # Read: find the app registration (no dry-run)
-        apps = json.loads(run_cmd(
-            ["az", "ad", "app", "list", "--display-name", app_name,
-             "--query", "[].{appId:appId,id:id}", "-o", "json"],
-            error_msg=f"Error listing app '{app_name}'",
-        ).stdout)
-        if not apps:
-            click.secho(f"❌ app '{app_name}' not found, skipping", fg="red", err=True)
-            continue
-        app_id = apps[0]["appId"]
-
-        # Read: Microsoft Graph service principal (object id + delegated scopes)
-        graph_sp = json.loads(run_cmd(
-            ["az", "ad", "sp", "show", "--id", GRAPH_APP_ID,
-             "--query", "{id:id,scopes:oauth2PermissionScopes[].{id:id,value:value}}", "-o", "json"],
-            error_msg="Error fetching Microsoft Graph service principal",
-        ).stdout)
-        graph_sp_id = graph_sp["id"]
-        scope_ids = {s["value"]: s["id"] for s in graph_sp["scopes"]}
-        unknown = [p for p in wanted if p not in scope_ids]
-        if unknown:
-            click.secho(f"❌ Unknown Graph delegated permission(s): {', '.join(unknown)}", fg="red", err=True)
-            continue
-
-        # Read: the app's service principal object id (admin-consent client)
-        app_sp_id = run_cmd(
-            ["az", "ad", "sp", "show", "--id", app_id, "--query", "id", "-o", "tsv"],
-            error_msg=f"Error fetching service principal for app '{app_name}'",
-        ).stdout.strip()
-
-        # Read: existing redirect URLs to merge with (no dry-run)
-        existing = json.loads(run_cmd(
-            ["az", "ad", "app", "show", "--id", app_id, "--query", "web.redirectUris", "-o", "json"],
-            error_msg="Error fetching current redirect URLs",
-        ).stdout)
-        merged = list(dict.fromkeys([*(existing or []), *wanted_urls]))
-
-        plans.append({
-            "env": env,
-            "app_name": app_name,
-            "app_id": app_id,
-            "app_sp_id": app_sp_id,
-            "graph_sp_id": graph_sp_id,
-            "scope_ids": scope_ids,
-            "merged": merged,
-        })
+        plan = _plan_env(env, env_cfg, app_name, wanted, wanted_urls)
+        if plan:
+            plans.append(plan)
 
     if not plans:
         return
 
-    client_id = require_config("cicd_spn_client_id")
-    tenant_id = require_config("tenant_id")
-    keyvault_name = require_config("cicd_spn_keyvault")
-    secret_name = require_config("cicd_spn_secret_name")
-
-    # Write phase (elevated as the CICD SPN; permissions lowered on exit).
-    with elevated_spn(client_id, tenant_id, keyvault_name, secret_name, dry_run=dry_run):
+    # Write phase (elevated as the CICD SPN; permissions lowered on exit)
+    with elevated_cicd_spn(dry_run=dry_run):
         for plan in plans:
-            app_id, app_name = plan["app_id"], plan["app_name"]
-            app_sp_id, graph_sp_id = plan["app_sp_id"], plan["graph_sp_id"]
-            scope_ids, merged = plan["scope_ids"], plan["merged"]
-
-            # Write: add API permissions (dry-run aware)
-            api_permissions = [f"{scope_ids[p]}=Scope" for p in wanted]
-            run_cmd_or_dry(
-                ["az", "ad", "app", "permission", "add", "--id", app_id, "--api", GRAPH_APP_ID,
-                 "--api-permissions", *api_permissions],
-                dry_run=dry_run,
-                dry_run_msg=(
-                    f"Would add {len(wanted)} Graph delegated permission(s) on app {app_id} ({app_name})"
-                    f" via API {GRAPH_APP_ID}:\n    "
-                    + "\n    ".join(f"{p} ({scope_ids[p]}=Scope)" for p in wanted)
-                ),
-                error_msg="Error adding permissions",
-                success_msg="Permissions added",
-            )
-
-            # Grant admin consent via Graph oauth2PermissionGrants.
-            # The CLI's `admin-consent` rejects SPN tokens, so upsert the grant directly.
-            grants = json.loads(run_cmd(
-                ["az", "rest", "--method", "GET",
-                 "--url", f"https://graph.microsoft.com/v1.0/servicePrincipals/{app_sp_id}/oauth2PermissionGrants"],
-                error_msg="Error reading existing admin consent grants",
-            ).stdout).get("value", [])
-            grant = next((g for g in grants if g.get("resourceId") == graph_sp_id), None)
-            granted_scope = " ".join(dict.fromkeys([*(grant or {}).get("scope", "").split(), *wanted]))
-
-            if grant:
-                run_cmd_or_dry(
-                    ["az", "rest", "--method", "PATCH",
-                     "--url", f"https://graph.microsoft.com/v1.0/oauth2PermissionGrants/{grant['id']}",
-                     "--headers", "Content-Type=application/json",
-                     "--body", json.dumps({"scope": granted_scope})],
-                    dry_run=dry_run,
-                    dry_run_msg=(
-                        f"Would update admin consent grant {grant['id']} on SP {app_sp_id} ({app_name})"
-                        f" → scope: {granted_scope}"
-                    ),
-                    error_msg="Error updating admin consent",
-                    success_msg="Admin consent updated",
-                )
-            else:
-                run_cmd_or_dry(
-                    ["az", "rest", "--method", "POST",
-                     "--url", "https://graph.microsoft.com/v1.0/oauth2PermissionGrants",
-                     "--headers", "Content-Type=application/json",
-                     "--body", json.dumps({
-                         "clientId": app_sp_id,
-                         "consentType": "AllPrincipals",
-                         "resourceId": graph_sp_id,
-                         "scope": granted_scope,
-                     })],
-                    dry_run=dry_run,
-                    dry_run_msg=(
-                        f"Would grant admin consent on SP {app_sp_id} ({app_name})"
-                        f" for Graph {graph_sp_id} → scope: {granted_scope}"
-                    ),
-                    error_msg="Error granting admin consent",
-                    success_msg="Admin consent granted",
-                )
-
-            # Write: update redirect URLs (dry-run aware)
-            run_cmd_or_dry(
-                ["az", "ad", "app", "update", "--id", app_id, "--web-redirect-uris", *merged],
-                dry_run=dry_run,
-                dry_run_msg=(
-                    f"Would set {len(merged)} redirect URI(s) on app {app_id} ({app_name}):\n    "
-                    + "\n    ".join(merged)
-                ),
-                error_msg="Error updating redirect URLs",
-                success_msg="Redirect URLs updated",
-            )
+            _add_permissions(plan, wanted, dry_run)
+            _grant_admin_consent(plan, wanted, dry_run)
+            _update_redirect_urls(plan, dry_run)

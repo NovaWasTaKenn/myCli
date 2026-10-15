@@ -1,7 +1,9 @@
 import click
-import os
+from pathlib import Path
 
 from helpers.shell import run_cmd
+
+TEMPLATES_DIR = Path.home() / ".dotfiles/modules/home-manager/cli/src/obsidian/pandoc/templates"
 
 
 @click.group()
@@ -13,12 +15,8 @@ def notes():
 @click.argument("name")
 @click.option("--pane", is_flag=True, help="Use a pane instead of a window.")
 def quick(name, pane):
-    tmux_cmd = (
-        ["tmux", "split-window", "-v", f'nvim "+ObsidianNew {name}"']
-        if pane
-        else ["tmux", "new-window", f'nvim "+ObsidianNew {name}"']
-    )
-    run_cmd(tmux_cmd, error_msg="Failed to open note in tmux")
+    tmux_target = ["split-window", "-v"] if pane else ["new-window"]
+    run_cmd(["tmux", *tmux_target, f'nvim "+ObsidianNew {name}"'], error_msg="Failed to open note in tmux")
 
 
 @notes.command()
@@ -55,31 +53,20 @@ def mdpdf_pandoc(
     input_file, output_file, fontsize: str, doctype: str, lang: str, latex: bool
 ) -> None:
     """Converts gf markdown to pdf using pandoc"""
-
-    click.echo(f"output type : {type(output_file)}")
-    if not os.path.exists(output_file):
-        click.echo(f"Creating output file: {output_file}")
-        os.mknod(output_file)
-
-    click.echo(f"current working dir: {os.getcwd()}")
-
-    if latex and not output_file.endswith(".latex"):
-        raise Exception("output file must be .latex if --latex is true")
-    if not latex and not output_file.endswith(".pdf"):
-        raise Exception("output file must be .md if --latex is false")
-
     dest_format = "latex" if latex else "pdf"
+    if not output_file.endswith(f".{dest_format}"):
+        raise click.BadParameter(f"output file must be .{dest_format}", param_hint="OUTPUT_FILE")
 
     args: list[str] = [
         "pandoc",
         input_file,
         "-o",
-        f"{output_file}",
+        output_file,
         "--from=markdown+hard_line_breaks+raw_tex",
         f"--to={dest_format}",
         "--pdf-engine=xelatex",
         "--standalone",
-        f"--template={os.getenv("HOME")}/.dotfiles/modules/home-manager/cli/src/obsidian/pandoc/templates/eisvogel.latex",
+        f"--template={TEMPLATES_DIR / 'eisvogel.latex'}",
         "--listings",
         "-V",
         f"lang={lang}",
@@ -90,20 +77,11 @@ def mdpdf_pandoc(
     ]
 
     if doctype == "simple":
-        args += [
-            "-V",
-            "pagestyle=empty",
-            "-V",
-            "disable-header-and-footer=true",
-        ]
-
+        args += ["-V", "pagestyle=empty", "-V", "disable-header-and-footer=true"]
     if doctype == "report":
         args += ["--toc", "-V", "toc-own-page", "-V", "titlepage"]
 
-    click.echo(f"pandoc args : {args}")
-    result = run_cmd(args, error_msg="pandoc conversion failed")
-    click.echo(f"pandoc stdout: {result.stdout}")
-    click.echo(f"pandoc stderr: {result.stderr}")
+    run_cmd(args, error_msg="pandoc conversion failed", capture=False)
 
 
 @notes.command()
@@ -116,11 +94,5 @@ def mdpdf_pandoc(
 )
 def export(src, dest, start_at) -> None:
     """obsidian-export command, exports obsidian markdown notes from src obsidian vault to commonMarknotes in dest destination"""
-
-    pandoc_args: list[str] = [
-        "obsidian-export",
-        src,
-        dest,
-    ] + ([f"--start_at {start_at}"] if start_at else [])
-
-    run_cmd(pandoc_args, error_msg="obsidian-export failed", capture=False)
+    args = ["obsidian-export", src, dest] + (["--start-at", start_at] if start_at else [])
+    run_cmd(args, error_msg="obsidian-export failed", capture=False)

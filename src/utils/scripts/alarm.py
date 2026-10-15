@@ -1,4 +1,5 @@
 import click
+import shlex
 import shutil
 import subprocess
 import re
@@ -9,12 +10,12 @@ from helpers.shell import run_cmd
 
 
 def _get_notify_command(message: str) -> str:
-    """Return the appropriate notification command for the current environment."""
+    """Return the shell-quoted notification command for the current environment."""
     # WSL: use wsl-notify-send.exe for Windows toast notifications
     if shutil.which("wsl-notify-send.exe"):
-        return f'wsl-notify-send.exe --category "Alarm" "{message}"'
+        return shlex.join(["wsl-notify-send.exe", "--category", "Alarm", message])
     # Native Linux fallback
-    return f'notify-send --urgency=critical "⏰ Alarm" "{message}"'
+    return shlex.join(["notify-send", "--urgency=critical", "⏰ Alarm", message])
 
 
 def _duration_to_seconds(duration: str) -> int | None:

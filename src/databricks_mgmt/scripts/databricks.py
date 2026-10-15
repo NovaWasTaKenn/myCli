@@ -6,48 +6,75 @@ import os
 import time
 from urllib import error, request
 from urllib.parse import quote
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 
-from helpers.config import require_config
-from helpers.shell import run_cmd
+from helpers.azure import resolve_environments, strip_environment_prefix
+from helpers.shell import run_json
 
 DEFAULT_HOST = "https://accounts.azuredatabricks.net"
 PATCH_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:PatchOp"
-ENV_PREFIXES = {"d", "t", "r", "p"}
 TERMINAL_RUN_STATES = {"TERMINATED", "SKIPPED", "INTERNAL_ERROR", "BLOCKED"}
 RUN_POLL_INTERVAL_SECONDS = 10
 RUN_TIMEOUT_SECONDS = 3600
 
 
-def _strip_environment_prefix(resource_name: str) -> str:
-    normalized = resource_name.lower()
-    if normalized[:1] in ENV_PREFIXES and normalized[1:3] == "d9":
-        return resource_name[1:]
-    return resource_name
+def _api(
+    host: str,
+    token: str,
+    path: str,
+    method: str = "GET",
+    body: Optional[dict] = None,
+    content_type: str = "application/json",
+) -> dict:
+    """Call a Databricks REST endpoint and return its JSON response ({} if empty)."""
+    req = request.Request(
+        f"{host.rstrip('/')}{path}",
+        data=json.dumps(body).encode("utf-8") if body is not None else None,
+        method=method,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": content_type},
+    )
+    try:
+        with request.urlopen(req) as response:
+            payload = response.read().decode("utf-8")
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+        raise click.ClickException(f"Databricks API {method} {path} failed with HTTP {exc.code}: {detail}") from exc
+    except error.URLError as exc:
+        raise click.ClickException(f"Failed to reach Databricks API: {exc.reason}") from exc
+    return json.loads(payload) if payload.strip() else {}
 
 
-def _scim_get(host: str, path: str, token: str) -> dict:
-    url = f"{host.rstrip('/')}{path}"
-    req = request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-    with request.urlopen(req) as response:
-        return json.loads(response.read().decode("utf-8"))
+def _resolve_connection(profile: str) -> Tuple[str, str]:
+    """Resolve host and token from a Databricks CLI profile."""
+    cfg_path = os.path.expanduser("~/.databrickscfg")
+    cfg = configparser.ConfigParser()
+    cfg.read(cfg_path)
+    section = profile if cfg.has_section(profile) else "DEFAULT"
+    host = cfg.get(section, "host", fallback=None)
+    if not host:
+        raise click.ClickException(f"No host found for profile '{profile}' in {cfg_path}. Configure the Databricks CLI.")
+
+    token = cfg.get(section, "token", fallback=None)
+    if token:
+        return host, token
+
+    token = (run_json(
+        ["databricks", "auth", "token", "--host", host, "--profile", profile],
+        error_msg="Failed to obtain token from Databricks CLI. Run 'databricks auth login' to configure your profile",
+    ) or {}).get("access_token")
+    if not token:
+        raise click.ClickException("Failed to parse token from Databricks CLI output")
+    return host, token
 
 
-def _lookup_group_id(host: str, account_id: str, token: str, group_name: str) -> str:
-    data = _scim_get(host, f"/api/2.0/accounts/{account_id}/scim/v2/Groups?filter={quote(f'displayName eq \"{group_name}\"')}", token)
-    resources = data.get("Resources", [])
+def _scim_lookup_id(host: str, account_id: str, token: str, resource: str, attribute: str, value: str) -> str:
+    """Return the ID of the SCIM resource (Users/Groups) whose attribute equals value."""
+    query = quote(f'{attribute} eq "{value}"')
+    resources = _api(host, token, f"/api/2.0/accounts/{account_id}/scim/v2/{resource}?filter={query}").get("Resources", [])
     if not resources:
-        raise click.ClickException(f"Group '{group_name}' not found")
-    return resources[0]["id"]
-
-
-def _lookup_user_id(host: str, account_id: str, token: str, username: str) -> str:
-    data = _scim_get(host, f"/api/2.0/accounts/{account_id}/scim/v2/Users?filter={quote(f'userName eq \"{username}\"')}", token)
-    resources = data.get("Resources", [])
-    if not resources:
-        raise click.ClickException(f"User '{username}' not found")
+        raise click.ClickException(f"{resource[:-1]} '{value}' not found")
     return resources[0]["id"]
 
 
@@ -63,97 +90,63 @@ def databricks():
 @click.option("--user", required=True, help="Databricks username (email)")
 @click.option("--action", type=click.Choice(["add", "delete"], case_sensitive=False), required=True, help="Whether to add or delete the user from the group")
 @click.option("--host", default=lambda: os.getenv("DATABRICKS_HOST"), show_default="env:DATABRICKS_HOST", help="Databricks account host")
-@click.option("--token", default=lambda: os.getenv("DATABRICKS_TOKEN"), show_default="env:DATABRICKS_TOKEN", help="Databricks OAuth/PAT token")
+@click.option("--token", default=lambda: os.getenv("DATABRICKS_TOKEN"), show_default="env:DATABRICKS_TOKEN", help="Databricks OAuth/PAT token (resolved from --profile if not set)")
 @click.option("--profile", default=lambda: os.getenv("DATABRICKS_CONFIG_PROFILE", "DEFAULT"), show_default="env:DATABRICKS_CONFIG_PROFILE", help="Databricks CLI profile")
 def patch_group_member(account_id: str, group: str, user: str, action: str, host: Optional[str], token: Optional[str], profile: str):
     """Add or remove a user from a Databricks account group using SCIM PATCH."""
     host = host or DEFAULT_HOST
-    _, token = _resolve_connection(host, token, profile)
+    token = token or _resolve_connection(profile)[1]
 
-    try:
-        click.secho(f"Looking up group '{group}'...", fg="cyan")
-        group_id = _lookup_group_id(host, account_id, token, group)
-        click.secho(f"Looking up user '{user}'...", fg="cyan")
-        user_id = _lookup_user_id(host, account_id, token, user)
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        click.secho(f"❌ SCIM lookup failed with HTTP {exc.code}", fg="red", err=True)
-        if body.strip():
-            click.echo(body, err=True)
-        raise click.Abort()
-    except error.URLError as exc:
-        click.secho(f"❌ Failed to reach Databricks API: {exc.reason}", fg="red", err=True)
-        raise click.Abort()
+    click.secho(f"Looking up group '{group}'...", fg="cyan")
+    group_id = _scim_lookup_id(host, account_id, token, "Groups", "displayName", group)
+    click.secho(f"Looking up user '{user}'...", fg="cyan")
+    user_id = _scim_lookup_id(host, account_id, token, "Users", "userName", user)
 
     if action == "add":
         operations = [{"op": "add", "path": "members", "value": [{"value": user_id}]}]
     else:
         operations = [{"op": "remove", "path": f'members[value eq "{user_id}"]'}]
 
-    url = f"{host.rstrip('/')}/api/2.0/accounts/{account_id}/scim/v2/Groups/{group_id}"
-    payload = json.dumps({"schemas": [PATCH_SCHEMA], "Operations": operations}).encode("utf-8")
-
-    req = request.Request(
-        url,
-        data=payload,
-        method="PATCH",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/scim+json",
-            "Accept": "application/json",
-        },
-    )
-
     click.secho(f"Patching group '{group}' ({group_id}) for user '{user}' ({user_id})...", fg="cyan")
-
-    try:
-        with request.urlopen(req) as response:
-            click.secho(f"✅ User {action}ed successfully", fg="green")
-            if response.status != 204:
-                body = response.read().decode("utf-8", errors="replace")
-                if body.strip():
-                    click.echo(body)
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        click.secho(f"❌ Databricks API request failed with HTTP {exc.code}", fg="red", err=True)
-        if body.strip():
-            click.echo(body, err=True)
-        raise click.Abort()
-    except error.URLError as exc:
-        click.secho(f"❌ Failed to reach Databricks API: {exc.reason}", fg="red", err=True)
-        raise click.Abort()
-
-
-def _trigger_job(host: str, token: str, job_id: int, params: dict, params_key: str) -> int:
-    """Trigger a Databricks job with a JSON payload and return the run_id."""
-    url = f"{host.rstrip('/')}/api/2.1/jobs/run-now"
-    body = {"job_id": job_id, "notebook_params": {params_key: json.dumps(params)}}
-    req = request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+    response = _api(
+        host, token, f"/api/2.0/accounts/{account_id}/scim/v2/Groups/{group_id}",
+        method="PATCH",
+        body={"schemas": [PATCH_SCHEMA], "Operations": operations},
+        content_type="application/scim+json",
     )
-    with request.urlopen(req) as response:
-        return json.loads(response.read().decode("utf-8"))["run_id"]
+    click.secho(f"✅ User {action}ed successfully", fg="green")
+    if response:
+        click.echo(json.dumps(response, indent=2))
 
 
-def _get_run(host: str, token: str, run_id: int) -> dict:
-    url = f"{host.rstrip('/')}/api/2.1/jobs/runs/get?run_id={run_id}"
-    req = request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-    with request.urlopen(req) as response:
-        return json.loads(response.read().decode("utf-8"))
+def _find_job_id(host: str, token: str, job_name: str) -> int:
+    """Return the ID of the uniquely named Databricks job."""
+    jobs = _api(host, token, f"/api/2.1/jobs/list?name={quote(job_name)}").get("jobs", [])
+    exact_matches = [job for job in jobs if job.get("settings", {}).get("name") == job_name]
+    if not exact_matches:
+        raise click.ClickException(f"Databricks job '{job_name}' not found")
+    if len(exact_matches) > 1:
+        raise click.ClickException(f"Multiple Databricks jobs named '{job_name}' found")
+    return exact_matches[0]["job_id"]
 
 
-def _get_run_output(host: str, token: str, run_id: int) -> dict:
-    url = f"{host.rstrip('/')}/api/2.1/jobs/runs/get-output?run_id={run_id}"
-    req = request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-    with request.urlopen(req) as response:
-        return json.loads(response.read().decode("utf-8"))
+def _run_mount_job(host: str, token: str, job_name: str, params: dict, dry_run: bool) -> Optional[int]:
+    """Trigger the mount job with params as its `list_mount_point_string` notebook param."""
+    job_id = _find_job_id(host, token, job_name)
+    click.secho(f"  Job: {job_name} ({job_id})", fg="cyan")
+    click.secho("\n📋 Job payload list_mount_point_string:", fg="cyan")
+    click.echo(json.dumps(params, indent=2))
+    if dry_run:
+        click.secho("\n⚠️  [DRY RUN] Job not triggered.", fg="yellow")
+        return None
+
+    run_id = _api(
+        host, token, "/api/2.1/jobs/run-now",
+        method="POST",
+        body={"job_id": job_id, "notebook_params": {"list_mount_point_string": json.dumps(params)}},
+    )["run_id"]
+    click.secho(f"\n✅ Job triggered successfully — run_id: {run_id}", fg="green")
+    return run_id
 
 
 def _wait_for_run(host: str, token: str, run_id: int) -> dict:
@@ -161,9 +154,8 @@ def _wait_for_run(host: str, token: str, run_id: int) -> dict:
     previous_state = None
 
     while time.monotonic() < deadline:
-        run = _get_run(host, token, run_id)
-        state = run.get("state", {})
-        life_cycle_state = state.get("life_cycle_state", "UNKNOWN")
+        run = _api(host, token, f"/api/2.1/jobs/runs/get?run_id={run_id}")
+        life_cycle_state = run.get("state", {}).get("life_cycle_state", "UNKNOWN")
         if life_cycle_state != previous_state:
             click.secho(f"  Run {run_id}: {life_cycle_state}", fg="cyan")
             previous_state = life_cycle_state
@@ -174,88 +166,13 @@ def _wait_for_run(host: str, token: str, run_id: int) -> dict:
     raise click.ClickException(f"Run {run_id} did not finish within {RUN_TIMEOUT_SECONDS // 60} minutes")
 
 
-def _find_job_id(host: str, token: str, job_name: str) -> int:
-    """Return the ID of the uniquely named Databricks job."""
-    url = f"{host.rstrip('/')}/api/2.1/jobs/list?name={quote(job_name)}"
-    req = request.Request(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-    )
-    try:
-        with request.urlopen(req) as response:
-            jobs = json.loads(response.read().decode("utf-8")).get("jobs", [])
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise click.ClickException(f"Job lookup failed with HTTP {exc.code}: {body}") from exc
-    except error.URLError as exc:
-        raise click.ClickException(f"Failed to reach Databricks API: {exc.reason}") from exc
-
-    exact_matches = [job for job in jobs if job.get("settings", {}).get("name") == job_name]
-    if not exact_matches:
-        raise click.ClickException(f"Databricks job '{job_name}' not found")
-    if len(exact_matches) > 1:
-        raise click.ClickException(f"Multiple Databricks jobs named '{job_name}' found")
-    return exact_matches[0]["job_id"]
-
-
-def _resolve_connection(profile: str) -> Tuple[str, str]:
-    """Resolve host and token, using the Databricks CLI profile."""
-
-    cfg_path = os.path.expanduser("~/.databrickscfg")
-    cfg = configparser.ConfigParser()
-    cfg.read(cfg_path)
-    section = profile if cfg.has_section(profile) else "DEFAULT"
-    host = cfg.get(section, "host", fallback=None)
-    if not host:
-        click.secho(f"❌ No host found for profile '{profile}' in {cfg_path}. Pass --host or configure the Databricks CLI.", fg="red", err=True)
-        raise click.Abort()
-
-    token = cfg.get(section, "token", fallback=None)
-    if token:
-        return host, token
-
-    result = run_cmd(
-        ["databricks", "auth", "token", "--host", host, "--profile", profile],
-        error_msg="Failed to obtain token from Databricks CLI. Run 'databricks auth login' to configure your profile",
-    )
-    try:
-        token = json.loads(result.stdout)["access_token"]
-    except (KeyError, json.JSONDecodeError) as e:
-        click.secho(f"❌ Failed to parse token from Databricks CLI output: {e}", fg="red", err=True)
-        raise click.Abort()
-
-    return host, token
-
-
-def _run_mount_job(host: str, token: str, job_id: int, params: dict, dry_run: bool) -> Optional[int]:
-    payload_str = json.dumps(params, indent=2)
-    click.secho(f"\n📋 Job payload list_mount_point_string:", fg="cyan")
-    click.echo(payload_str)
-    if dry_run:
-        click.secho("\n⚠️  [DRY RUN] Job not triggered.", fg="yellow")
-        return None
-    try:
-        run_id = _trigger_job(host, token, job_id, params, "list_mount_point_string")
-        click.secho(f"\n✅ Job triggered successfully — run_id: {run_id}", fg="green")
-        return run_id
-    except error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        click.secho(f"❌ Databricks API failed with HTTP {exc.code}", fg="red", err=True)
-        if body.strip():
-            click.echo(body, err=True)
-        raise click.Abort()
-    except error.URLError as exc:
-        click.secho(f"❌ Failed to reach Databricks API: {exc.reason}", fg="red", err=True)
-        raise click.Abort()
-
-
-def _report_mount_jobs(runs: list[Tuple[str, str, int, str]]) -> None:
+def _report_mount_jobs(runs: List[Tuple[str, str, int, str]]) -> None:
+    """Wait for each triggered run and report its outcome; abort if any failed."""
     failed = False
     for host, token, run_id, environment in runs:
         click.secho(f"\n🌍 Checking {environment.upper()} run {run_id}", fg="magenta", bold=True)
         try:
-            run = _wait_for_run(host, token, run_id)
-            state = run.get("state", {})
+            state = _wait_for_run(host, token, run_id).get("state", {})
             result_state = state.get("result_state")
             if result_state == "SUCCESS":
                 click.secho(f"✅ Run {run_id} completed successfully", fg="green")
@@ -266,20 +183,37 @@ def _report_mount_jobs(runs: list[Tuple[str, str, int, str]]) -> None:
             click.secho(f"❌ Run {run_id} failed: {result_state or state.get('life_cycle_state', 'UNKNOWN')}", fg="red", err=True)
             if state_message:
                 click.echo(state_message, err=True)
-            try:
-                output = _get_run_output(host, token, run_id)
-                if output.get("error") and output["error"] != state_message:
-                    click.echo(output["error"], err=True)
-                if output.get("error_trace"):
-                    click.echo(output["error_trace"], err=True)
-            except (error.HTTPError, error.URLError):
-                pass
-        except (click.ClickException, error.HTTPError, error.URLError) as exc:
+            output = _api(host, token, f"/api/2.1/jobs/runs/get-output?run_id={run_id}")
+            if output.get("error") and output["error"] != state_message:
+                click.echo(output["error"], err=True)
+            if output.get("error_trace"):
+                click.echo(output["error_trace"], err=True)
+        except click.ClickException as exc:
             failed = True
-            click.secho(f"❌ Could not get result for run {run_id}: {exc}", fg="red", err=True)
+            click.secho(f"❌ Could not get result for run {run_id}: {exc.message}", fg="red", err=True)
 
     if failed:
         raise click.Abort()
+
+
+def _trigger_mounts(job_name: str, envs: Dict[str, Dict[str, Any]], connect, build_params, dry_run: bool) -> None:
+    """Pipeline shared by the mount commands: per env, connect → trigger job; then wait for all runs.
+
+    connect(env) returns (host, token); build_params(env, env_cfg) returns the job payload.
+    """
+    click.secho(f"\n{'='*60}", fg="cyan", bold=True)
+    click.secho(f"💡 Job name: {job_name} | Environments: {', '.join(envs)}", fg="cyan")
+    click.secho(f"{'='*60}", fg="cyan", bold=True)
+
+    runs = []
+    for env, env_cfg in envs.items():
+        click.secho(f"\n🌍 {env.upper()} ({env_cfg['name']})", fg="magenta", bold=True)
+        host, token = connect(env)
+        run_id = _run_mount_job(host, token, job_name, build_params(env, env_cfg), dry_run)
+        if run_id is not None:
+            runs.append((host, token, run_id, env))
+
+    _report_mount_jobs(runs)
 
 
 @databricks.command(name="mount-blob")
@@ -287,7 +221,7 @@ def _report_mount_jobs(runs: list[Tuple[str, str, int, str]]) -> None:
 @click.argument("container", type=str)
 @click.argument("mount_path", type=str)
 @click.argument("project_code", type=str)
-@click.option("--envs", multiple=True, default=("d", "t", "r", "p"), show_default=True, help="Environment prefixes to process")
+@click.option("--envs", multiple=True, help="Environment prefixes to process (default: d, t, r, p)")
 @click.option("--dry-run", is_flag=True, help="Print the job payload without triggering the job")
 @click.option("--force", default="false", show_default=True, type=click.Choice(["true", "false"]), help="Force remount if already mounted")
 def mount_blob(
@@ -297,49 +231,30 @@ def mount_blob(
     project_code: str,
     envs: Tuple[str, ...],
     dry_run: bool,
-    force: bool
+    force: str
 ):
     """Trigger a Databricks job to mount a Blob Storage container via SAS key.
 
     STORAGE_ACCOUNT may omit the environment prefix or include one that will be replaced.
 
-    Requires a databricks workspace named after the workspace for authentication
+    Authenticates with the Databricks CLI profile named after each env's workspace
+    ({env}{PROJECT_CODE}adb01).
 
     Example:
-        mycli databricks mount-blob 'Mount blob {environment}' d90021sa01 mycontainer mydata d91231 --envs d --envs t
+        mycli databricks mount-blob d90021sa01 mycontainer mydata d91231 --envs d --envs t
     """
-    environments = require_config("azure_environments")
+    storage_account_suffix = strip_environment_prefix(storage_account)
 
-
-    storage_account_suffix = _strip_environment_prefix(storage_account)
-    job_name = "Job_Mount_Blob_Serverless"
-
-    click.secho(f"\n{'='*60}", fg="cyan", bold=True)
-    click.secho(f"💡 Job name: {job_name} | Environments: {', '.join(envs)}", fg="cyan")
-    click.secho(f"{'='*60}", fg="cyan", bold=True)
-
-    runs = []
-    for env_short in envs:
-
-        profile = f"{env_short}{project_code}adb01"
-
-        host, token = _resolve_connection(profile)
-
-        if env_short not in environments:
-            click.secho(f"❌ Unknown environment prefix '{env_short}' — skipping", fg="red", err=True)
-            continue
-        job_id = _find_job_id(host, token, job_name)
-        storage_account_name = f"{env_short}{storage_account_suffix}"
-        click.secho(f"\n🌍 {env_short.upper()}", fg="magenta", bold=True)
-        click.secho(f"  Job: {job_name} ({job_id})", fg="cyan")
+    def build_params(env: str, env_cfg: Dict[str, Any]) -> dict:
+        storage_account_name = f"{env}{storage_account_suffix}"
         click.secho(f"  Storage Account: {storage_account_name} | Container: {container} | Mount: {mount_path}", fg="cyan")
-        params = {
+        return {
             "config": {
-                "secretScope_name": f"SecretScope-{env_short}{project_code}-databricks",
+                "secretScope_name": f"SecretScope-{env}{project_code}-databricks",
             },
             "list_mount": [
                 {
-                    "name": f"{mount_path}",
+                    "name": mount_path,
                     "source": f"wasbs://{container}@{storage_account_name}.blob.core.windows.net/",
                     "sas_key": f"{storage_account_name}-{container}-sas",
                     "force": force,
@@ -348,11 +263,14 @@ def mount_blob(
                 }
             ],
         }
-        run_id = _run_mount_job(host, token, job_id, params, dry_run)
-        if run_id is not None:
-            runs.append((host, token, run_id, env_short))
 
-    _report_mount_jobs(runs)
+    _trigger_mounts(
+        "Job_Mount_Blob_Serverless",
+        resolve_environments(envs),
+        connect=lambda env: _resolve_connection(f"{env}{project_code}adb01"),
+        build_params=build_params,
+        dry_run=dry_run,
+    )
 
 
 @databricks.command(name="mount-datalake")
@@ -360,7 +278,7 @@ def mount_blob(
 @click.argument("container", type=str)
 @click.argument("mount_path", type=str)
 @click.argument("project_code", type=str)
-@click.option("--envs", multiple=True, default=("d", "t", "r", "p"), show_default=True, help="Environment prefixes to process")
+@click.option("--envs", multiple=True, help="Environment prefixes to process (default: d, t, r, p)")
 @click.option("--force", default="false", show_default=True, type=click.Choice(["true", "false"]), help="Force remount if already mounted")
 @click.option("--profile", default=lambda: os.getenv("DATABRICKS_CONFIG_PROFILE", "DEFAULT"), show_default="env:DATABRICKS_CONFIG_PROFILE", help="Databricks CLI profile")
 @click.option("--dry-run", is_flag=True, help="Print the job payload without triggering the job")
@@ -379,45 +297,34 @@ def mount_datalake(
     DATALAKE may omit the environment prefix or include one that will be replaced.
 
     Example:
-        mycli databricks mount-datalake 'Mount datalake {environment}' d90021adl01 myfs mydata myproj --envs d --envs t
+        mycli databricks mount-datalake d90021adl01 myfs mydata myproj --envs d --envs t
     """
-    environments = require_config("azure_environments")
-    host, token = _resolve_connection(profile)
-    datalake_suffix = _strip_environment_prefix(datalake)
-    job_name = "Job_Mount_Datalake_Serverless"
+    connection = _resolve_connection(profile)
+    datalake_suffix = strip_environment_prefix(datalake)
 
-    click.secho(f"\n{'='*60}", fg="cyan", bold=True)
-    click.secho(f"💡 Job name: {job_name} | Environments: {', '.join(envs)}", fg="cyan")
-    click.secho(f"{'='*60}", fg="cyan", bold=True)
-
-    runs = []
-    for env_short in envs:
-        if env_short not in environments:
-            click.secho(f"❌ Unknown environment prefix '{env_short}' — skipping", fg="red", err=True)
-            continue
-        env_display = environments[env_short]["name"]
-        job_id = _find_job_id(host, token, job_name)
-        datalake_name = f"{env_short}{datalake_suffix}"
-        click.secho(f"\n🌍 {env_short.upper()} ({env_display})", fg="magenta", bold=True)
-        click.secho(f"  Job: {job_name} ({job_id})", fg="cyan")
+    def build_params(env: str, env_cfg: Dict[str, Any]) -> dict:
+        datalake_name = f"{env}{datalake_suffix}"
+        env_display = env_cfg["name"]
         click.secho(f"  Datalake: {datalake_name} | Container: {container} | Mount: {mount_path}", fg="cyan")
-        params = {
+        return {
             "config": {
-                "clientId_key": f"{env_short}{project_code}spnadl-clientID",
+                "clientId_key": f"{env}{project_code}spnadl-clientID",
                 "clientSecret_key": f"{env_display}{project_code}spnadl-secret",
                 "secretScope_key": f"SecretScope-{env_display}{project_code}akv01",
             },
             "list_mount": [
                 {
-                    "name": f"{mount_path}",
+                    "name": mount_path,
                     "source": f"abfss://{container}@{datalake_name}.dfs.core.windows.net/",
                     "force": force,
                 }
             ],
         }
-        run_id = _run_mount_job(host, token, job_id, params, dry_run)
-        if run_id is not None:
-            runs.append((host, token, run_id, env_short))
 
-    _report_mount_jobs(runs)
-
+    _trigger_mounts(
+        "Job_Mount_Datalake_Serverless",
+        resolve_environments(envs),
+        connect=lambda env: connection,
+        build_params=build_params,
+        dry_run=dry_run,
+    )

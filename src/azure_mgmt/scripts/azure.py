@@ -10,6 +10,7 @@ from typing import List, Dict
 from .datalake import datalake
 from .spn import spn
 from .oauth import setup_oauth
+from .search import search
 
 
 @click.group()
@@ -280,3 +281,4 @@ def peek_sb_queue(
 azure.add_command(datalake)
 azure.add_command(spn)
 azure.add_command(setup_oauth)
+azure.add_command(search)

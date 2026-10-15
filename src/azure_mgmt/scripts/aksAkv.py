@@ -1,9 +1,9 @@
-"""Azure Key Vault commands."""
+"""Azure Key Vault Secrets Store CSI driver helpers for AKS."""
 
 """
 TODO:
 
-aks akv : 
+aks akv :
 - Install csi driver
 - Give permissions (acl) to csi driver umi
 - Generate spc
@@ -27,35 +27,43 @@ azurefile csi driver :
 import click
 import json
 import yaml
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-
-from .utils import format_objects_array
-from helpers.config import require_config
-from helpers.shell import run_cmd
-
-MULTI_KV_CODE = require_config("multi_kv_code")
-SOCLE_KV_CODE = require_config("socle_kv_code")
 from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+from .utils import dump_manifests, format_objects_array, write_output
+from helpers.config import get_config
+from helpers.shell import run_cmd, run_json, run_text
+from helpers.ui import banner
+
+MULTI_KV_CODE = get_config("multi_kv_code")
+SOCLE_KV_CODE = get_config("socle_kv_code")
+DOCKER_CONFIG_SECRET = "docker-config-json"
+CSI_DRIVER = "secrets-store.csi.k8s.io"
 
 
-@click.group()
-def aksAkv():
-    """Azure Key Vault management commands"""
-    pass
+def _env_var_name(secret: str) -> str:
+    return secret.upper().replace("-", "_")
+
+
+def _secret_env_var(name: str, secret_name: str, key: str) -> Dict[str, Any]:
+    return {"name": name, "valueFrom": {"secretKeyRef": {"name": secret_name, "key": key}}}
+
+
+def _csi_volume(name: str, spc_name: str) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "csi": {"driver": CSI_DRIVER, "readOnly": True, "volumeAttributes": {"secretProviderClass": spc_name}},
+    }
 
 
 def _ensure_akv_addon_enabled(aks_code: str, aks_env: str) -> None:
     """Ensure the Azure Key Vault Secrets Provider addon is enabled on the AKS cluster."""
     resource_group = f"r400{aks_env}d9{aks_code}"
     cluster_name = f"{aks_env}d9{aks_code}aks01"
-    
-    click.echo(f"\n{'='*60}")
-    click.echo("Checking Azure Key Vault Secrets Provider addon...")
-    click.echo(f"{'='*60}\n")
-    
-    # Check if addon is already enabled
-    result = run_cmd(
+
+    banner("Checking Azure Key Vault Secrets Provider addon...")
+    enabled = run_text(
         ["az", "aks", "show",
          "--resource-group", resource_group,
          "--name", cluster_name,
@@ -63,97 +71,42 @@ def _ensure_akv_addon_enabled(aks_code: str, aks_env: str) -> None:
          "-o", "tsv"],
         error_msg=f"Error checking addons on {cluster_name}",
     )
-
-    is_enabled = result.stdout.strip().lower() == "true"
-
-    if is_enabled:
+    if enabled.lower() == "true":
         click.echo(f"  ✅ Azure Key Vault Secrets Provider addon is already enabled on {cluster_name}")
-    else:
-        click.echo(f"  ⚠️  Azure Key Vault Secrets Provider addon is not enabled")
-        click.echo(f"  Enabling addon on {cluster_name}...")
+        return
 
-        run_cmd(
-            ["az", "aks", "enable-addons",
-             "--addons", "azure-keyvault-secrets-provider",
-             "--name", cluster_name,
-             "--resource-group", resource_group],
-            error_msg=f"Error enabling addon on {cluster_name}",
-        )
-
-        click.echo(f"  ✅ Azure Key Vault Secrets Provider addon enabled successfully")
+    click.echo(f"  ⚠️  Azure Key Vault Secrets Provider addon is not enabled, enabling it on {cluster_name}...")
+    run_cmd(
+        ["az", "aks", "enable-addons",
+         "--addons", "azure-keyvault-secrets-provider",
+         "--name", cluster_name,
+         "--resource-group", resource_group],
+        error_msg=f"Error enabling addon on {cluster_name}",
+        success_msg="Azure Key Vault Secrets Provider addon enabled successfully",
+    )
 
 
 def _fetch_identity_id(aks_code: str, aks_env: str) -> str:
-    """Fetch the managed identity ID from an AKS cluster."""
-    resource_group = f"r400{aks_env}d9{aks_code}"
+    """Fetch the Key Vault Secrets Provider managed identity client ID from an AKS cluster."""
     kube_cluster = f"{aks_env}d9{aks_code}aks01"
-    
+
     click.echo(f"Fetching identity ID from AKS cluster: {kube_cluster}...")
-    result = run_cmd(
+    identity_id = run_text(
         ["az", "aks", "show",
-         "--resource-group", resource_group,
+         "--resource-group", f"r400{aks_env}d9{aks_code}",
          "--name", kube_cluster,
          "--query", "addonProfiles.azureKeyvaultSecretsProvider.identity.clientId",
          "-o", "tsv"],
         error_msg=f"Error fetching identity ID from {kube_cluster}",
     )
-    identity_id = result.stdout.strip()
-    
     if not identity_id:
-        click.echo("Error: Could not fetch identity ID from AKS cluster. Make sure the Azure Key Vault Secrets Provider addon is enabled.", err=True)
-        raise click.Abort()
-    
+        raise click.ClickException(
+            "Could not fetch identity ID from AKS cluster. "
+            "Make sure the Azure Key Vault Secrets Provider addon is enabled."
+        )
+
     click.echo(f"Using identity ID: {identity_id}")
     return identity_id
-
-
-def _get_identity_object_id(client_id: str) -> str:
-    """Get the object ID of a managed identity from its client ID."""
-    result = run_cmd(
-        ["az", "ad", "sp", "show", "--id", client_id, "--query", "id", "-o", "tsv"],
-        error_msg=f"Error fetching object ID for client ID {client_id}",
-    )
-    object_id = result.stdout.strip()
-    
-    if not object_id:
-        click.echo(f"Error: Could not fetch object ID for client ID {client_id}", err=True)
-        raise click.Abort()
-    
-    return object_id
-
-
-def _check_keyvault_access(keyvault_name: str, object_id: str) -> bool:
-    """Check if an identity has access policies configured for a Key Vault."""
-    result = run_cmd(
-        ["az", "keyvault", "show",
-         "--name", keyvault_name,
-         "--query", f"properties.accessPolicies[?objectId=='{object_id}']",
-         "-o", "json"],
-        error_msg=f"Error fetching access policies for {keyvault_name}",
-    )
-    
-    access_policies = json.loads(result.stdout)
-    return len(access_policies) > 0
-
-def _grant_keyvault_access(keyvault_name: str, object_id: str, include_certificates: bool = False) -> None:
-    """Grant access policy to an identity for a Key Vault."""
-    click.echo(f"  Granting access to {keyvault_name}...")
-    
-    cmd = [
-        "az", "keyvault", "set-policy",
-        "--name", keyvault_name,
-        "--object-id", object_id,
-        "--secret-permissions", "get", "list"
-    ]
-    
-    if include_certificates:
-        cmd.extend([
-            "--certificate-permissions", "get", "list",
-            "--key-permissions", "get", "list"
-        ])
-    
-    run_cmd(cmd, error_msg=f"Error granting access to {keyvault_name}")
-    click.echo(f"  ✅ Access granted to {keyvault_name}")
 
 
 def _ensure_keyvault_access(
@@ -161,52 +114,58 @@ def _ensure_keyvault_access(
     identity_client_id: str,
     certificate_kv_name: Optional[str] = None
 ) -> None:
-    """Ensure the managed identity has access to all specified Key Vaults."""
-    click.echo(f"\n{'='*60}")
-    click.echo("Checking Key Vault access policies...")
-    click.echo(f"{'='*60}\n")
-    
-    # Get object ID from client ID
-    object_id = _get_identity_object_id(identity_client_id)
+    """Ensure the managed identity has access policies on all specified Key Vaults."""
+    banner("Checking Key Vault access policies...")
+
+    object_id = run_text(
+        ["az", "ad", "sp", "show", "--id", identity_client_id, "--query", "id", "-o", "tsv"],
+        error_msg=f"Error fetching object ID for client ID {identity_client_id}",
+    )
+    if not object_id:
+        raise click.ClickException(f"Could not fetch object ID for client ID {identity_client_id}")
     click.echo(f"Identity object ID: {object_id}\n")
-    
+
     for kv_name in keyvault_names:
         click.echo(f"Checking access to {kv_name}...")
-        has_access = _check_keyvault_access(kv_name, object_id)
-        
-        if has_access:
+        policies = run_json(
+            ["az", "keyvault", "show",
+             "--name", kv_name,
+             "--query", f"properties.accessPolicies[?objectId=='{object_id}']",
+             "-o", "json"],
+            error_msg=f"Error fetching access policies for {kv_name}",
+        )
+        if policies:
             click.echo(f"  ✅ Identity already has access to {kv_name}")
-        else:
-            click.echo(f"  ⚠️  Identity does not have access to {kv_name}")
-            # Check if this is the certificate keyvault
-            is_cert_kv = certificate_kv_name is not None and kv_name == certificate_kv_name
-            _grant_keyvault_access(kv_name, object_id, include_certificates=is_cert_kv)
+            continue
+
+        click.echo(f"  ⚠️  Identity does not have access to {kv_name}, granting it...")
+        cmd = ["az", "keyvault", "set-policy", "--name", kv_name, "--object-id", object_id,
+               "--secret-permissions", "get", "list"]
+        if kv_name == certificate_kv_name:
+            cmd += ["--certificate-permissions", "get", "list", "--key-permissions", "get", "list"]
+        run_cmd(cmd, error_msg=f"Error granting access to {kv_name}", success_msg=f"Access granted to {kv_name}")
 
 
 def _fetch_keyvault_secrets(keyvault_name: str, secrets_filter: Optional[tuple] = None) -> List[str]:
-    """Fetch secrets from a Key Vault, optionally filtering to specific secrets."""
+    """Fetch secret names from a Key Vault, optionally restricted to secrets_filter."""
     click.echo(f"Fetching secrets from Key Vault: {keyvault_name}...")
-    
-    result = run_cmd(
+    all_secrets = run_json(
         ["az", "keyvault", "secret", "list", "--vault-name", keyvault_name, "--query", "[].name", "-o", "json"],
         error_msg=f"Error listing secrets in {keyvault_name}",
-    )
-    
-    all_secrets = json.loads(result.stdout)
+    ) or []
     click.echo(f"  Found {len(all_secrets)} total secret(s)")
-    
+
+    secret_list = all_secrets
     if secrets_filter:
         secret_list = [s for s in all_secrets if s in secrets_filter]
-        if len(secret_list) != len(secrets_filter):
-            missing = set(secrets_filter) - set(secret_list)
+        missing = set(secrets_filter) - set(secret_list)
+        if missing:
             click.echo(f"  Warning: The following secrets were not found: {', '.join(missing)}", err=True)
-    else:
-        secret_list = all_secrets
-    
+
     if not secret_list:
         click.echo(f"  No secrets found in the Key Vault: {keyvault_name}", err=True)
         return []
-    
+
     click.echo(f"  Using {len(secret_list)} secret(s)")
     return secret_list
 
@@ -222,7 +181,7 @@ def _collect_keyvault_configs(
 ) -> Dict[str, Dict[str, Any]]:
     """
     Collect all keyvault configurations with their secrets.
-    
+
     Args:
         secret_objects_mapping: Optional dict mapping namespace to list of secret object configs.
             Each config has 'secret_name' and 'secrets' (list of KV secret names).
@@ -232,59 +191,68 @@ def _collect_keyvault_configs(
                     {"secret_name": "app-creds", "secrets": ["sa-key"]}
                 ]
             }
-    
+
     Returns:
         Dict mapping keyvault names to their configuration:
         {
             "kv_name": {
                 "secrets": ["secret1", "secret2", ...],
-                "secret_objects": [
-                    {"secret_name": "name", "secrets": ["s1", "s2"]},
-                    ...
-                ],
+                "secret_name": "project-secret",
+                "secret_objects": [{"secret_name": "name", "secrets": ["s1", "s2"]}, ...] or None,
                 "spc_name": "az-kv-name-spc",
                 "mount_path": "/mnt/kv-name-secrets"
             }
         }
     """
-
-    click.echo(f"mapping : {secret_objects_mapping}")
-    click.echo(f"namespace : {namespace}")
+    # (keyvault, kube secret name, custom secret objects)
+    sources = [(keyvault_name, f"{project_name}-secret", (secret_objects_mapping or {}).get(namespace))]
+    if include_multi_kv:
+        sources.append((f"{aks_env}d9{MULTI_KV_CODE}akv01", "multi-secret", None))
 
     keyvaults_config = {}
-    
-    # Add main keyvault (always provided)
-    secrets = _fetch_keyvault_secrets(keyvault_name, secrets_filter)
-    if secrets:
-        # Check if there's a custom secret objects configuration for this namespace
-        secret_objects = None
-        if secret_objects_mapping and namespace in secret_objects_mapping:
-            secret_objects = secret_objects_mapping[namespace]
-        
-        keyvaults_config[keyvault_name] = {
-            "secrets": secrets,
-            "secret_name": f"{project_name}-secret",
-            "secret_objects": secret_objects,  # List of secret object configs or None
-            "spc_name": f"az-{keyvault_name}-spc",
-            "mount_path": f"/mnt/{keyvault_name}-secrets"
-        }
-    
-    # Add multi keyvault if requested
-    if include_multi_kv:
-        kv_name = f"{aks_env}d9{MULTI_KV_CODE}akv01"
+    for kv_name, secret_name, secret_objects in sources:
         secrets = _fetch_keyvault_secrets(kv_name, secrets_filter)
         if secrets:
             keyvaults_config[kv_name] = {
                 "secrets": secrets,
-                "secret_name": "multi-secret",
-                "secret_objects": None,  # Could be extended to support config for multi-kv
+                "secret_name": secret_name,
+                "secret_objects": secret_objects,
                 "spc_name": f"az-{kv_name}-spc",
-                "mount_path": f"/mnt/{kv_name}-secrets"
+                "mount_path": f"/mnt/{kv_name}-secrets",
             }
-
-    click.echo(f"kv vonfig collect: {keyvaults_config}")
-    
     return keyvaults_config
+
+
+def _spc(
+    spc_name: str,
+    keyvault_name: str,
+    namespace: str,
+    tenant_id: str,
+    identity_id: str,
+    secret_objects: List[Dict[str, Any]],
+    objects: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build a SecretProviderClass manifest using the AKS VM managed identity."""
+    return {
+        "apiVersion": "secrets-store.csi.x-k8s.io/v1",
+        "kind": "SecretProviderClass",
+        "metadata": {
+            "name": spc_name,
+            "namespace": namespace
+        },
+        "spec": {
+            "provider": "azure",
+            "secretObjects": secret_objects,
+            "parameters": {
+                "keyvaultName": keyvault_name,
+                "objects": format_objects_array(objects),
+                "tenantId": tenant_id,
+                "usePodIdentity": "false",
+                "useVMManagedIdentity": "true",
+                "userAssignedIdentityID": identity_id
+            }
+        }
+    }
 
 
 def _generate_spc_for_keyvault(
@@ -299,110 +267,41 @@ def _generate_spc_for_keyvault(
 ) -> Dict[str, Any]:
     """
     Generate a SecretProviderClass for a specific Key Vault.
-    
+
     Args:
         secret_objects_config: Optional list of custom secret object configurations.
             Each item should have 'secret_name' and 'secrets' keys.
     """
-    spc_name = f"az-{keyvault_name}-spc"
-    
-    # Check if docker-config-json secret exists
-    has_docker_config = "docker-config-json" in secrets
-    
-    # Separate docker-config-json from other secrets
-    regular_secrets = [s for s in secrets if s != "docker-config-json"]
-    
-    # Build secretObjects data for regular secrets
-    secret_objects_data = []
-    for secret in regular_secrets:
-        env_var_name = secret.upper().replace("-", "_")
-        secret_objects_data.append({
-            "objectName": secret,
-            "key": env_var_name
-        })
-    
-    # Build parameters objects array (includes all secrets)
-    objects_array = []
-    for secret in secrets:
-        objects_array.append({
-            "objectName": secret,
-            "objectType": "secret",
-            "objectVersion": ""
-        })
-    
-    # Build secretObjects list
+    regular_secrets = [s for s in secrets if s != DOCKER_CONFIG_SECRET]
+
+    # Custom config: one Opaque secret per configured object; default: a single one with all secrets
+    groups = (
+        [(obj.get("secret_name"), obj.get("secrets", [])) for obj in secret_objects_config]
+        if secret_objects_config
+        else [(secret_name, regular_secrets)]
+    )
     secret_objects = []
+    for name, names in groups:
+        data = [{"objectName": s, "key": _env_var_name(s)} for s in names if s in regular_secrets]
+        if data:
+            secret_objects.append({"secretName": name, "type": "Opaque", "data": data})
 
-    click.echo(f"secret objects config: {secret_objects_config}")
-    
-    # If custom secret objects config is provided, use it for regular secrets
-    if secret_objects_config:
-        for obj_config in secret_objects_config:
-            obj_secret_name = obj_config.get("secret_name")
-            obj_secrets = obj_config.get("secrets", [])
-            
-            # Build data for this secret object
-            obj_data = []
-            for secret in obj_secrets:
-                if secret in regular_secrets:
-                    env_var_name = secret.upper().replace("-", "_")
-                    obj_data.append({
-                        "objectName": secret,
-                        "key": env_var_name
-                    })
-
-            # Only add if there's data
-            if obj_data:
-                secret_objects.append({
-                    "secretName": obj_secret_name,
-                    "type": "Opaque",
-                    "data": obj_data
-                })
-    else:
-        # Default behavior: single Opaque secret with all regular secrets
-        if regular_secrets:
-            secret_objects.append({
-                "secretName": secret_name,
-                "type": "Opaque",
-                "data": secret_objects_data
-            })
-    
-    # Add docker-config-json secret if present
-    if has_docker_config:
+    if DOCKER_CONFIG_SECRET in secrets:
         secret_objects.append({
             "secretName": f"{project_name}-secret-acr",
             "type": "kubernetes.io/dockerconfigjson",
-            "data": [
-                {
-                    "objectName": "docker-config-json",
-                    "key": ".dockerconfigjson"
-                }
-            ]
+            "data": [{"objectName": DOCKER_CONFIG_SECRET, "key": ".dockerconfigjson"}]
         })
 
-    click.echo(f"secret objects : {secret_objects}")
-    
-    # Construct the SecretProviderClass
-    return {
-        "apiVersion": "secrets-store.csi.x-k8s.io/v1",
-        "kind": "SecretProviderClass",
-        "metadata": {
-            "name": spc_name,
-            "namespace": namespace
-        },
-        "spec": {
-            "provider": "azure",
-            "secretObjects": secret_objects,
-            "parameters": {
-                "keyvaultName": keyvault_name,
-                "objects": format_objects_array(objects_array),
-                "tenantId": tenant_id,
-                "usePodIdentity": "false",
-                "useVMManagedIdentity": "true",
-                "userAssignedIdentityID": identity_id
-            }
-        }
-    }
+    return _spc(
+        spc_name=f"az-{keyvault_name}-spc",
+        keyvault_name=keyvault_name,
+        namespace=namespace,
+        tenant_id=tenant_id,
+        identity_id=identity_id,
+        secret_objects=secret_objects,
+        objects=[{"objectName": s, "objectType": "secret", "objectVersion": ""} for s in secrets],
+    )
 
 
 def _generate_spc_for_certificates(
@@ -415,55 +314,26 @@ def _generate_spc_for_certificates(
     kube_secret_name: str
 ) -> Dict[str, Any]:
     """Generate a SecretProviderClass for TLS certificates from Key Vault."""
-    spc_name = f"az-{env}d9{socle_code}akv01-spc"
-    
-    
-    secret_objects_data = [
-        {"objectName": f"{cert_name}_Certificate", "key": "tls.crt"},
-        {"objectName": f"{cert_name}_PrivateKey", "key": "tls.key"}
-    ]
-    
-    objects_array = [
-        {
-            "objectName": cert_name,
-            "objectAlias": f"{cert_name}_Certificate",
-            "objectType": "cert",
-            "objectVersion": ""
-        },
-        {
-            "objectName": cert_name,
-            "objectAlias": f"{cert_name}_PrivateKey",
-            "objectType": "secret",
-            "objectVersion": ""
-        }
-    ]
-    
-    return {
-        "apiVersion": "secrets-store.csi.x-k8s.io/v1",
-        "kind": "SecretProviderClass",
-        "metadata": {
-            "name": spc_name,
-            "namespace": namespace
-        },
-        "spec": {
-            "provider": "azure",
-            "secretObjects": [
-                {
-                    "secretName": kube_secret_name,
-                    "type": "kubernetes.io/tls",
-                    "data": secret_objects_data
-                }
-            ],
-            "parameters": {
-                "keyvaultName": f"{env}d9{socle_code}akv01",
-                "objects": format_objects_array(objects_array),
-                "tenantId": tenant_id,
-                "usePodIdentity": "false",
-                "useVMManagedIdentity": "true",
-                "userAssignedIdentityID": identity_id
-            }
-        }
-    }
+    keyvault_name = f"{env}d9{socle_code}akv01"
+    return _spc(
+        spc_name=f"az-{keyvault_name}-spc",
+        keyvault_name=keyvault_name,
+        namespace=namespace,
+        tenant_id=tenant_id,
+        identity_id=identity_id,
+        secret_objects=[{
+            "secretName": kube_secret_name,
+            "type": "kubernetes.io/tls",
+            "data": [
+                {"objectName": f"{cert_name}_Certificate", "key": "tls.crt"},
+                {"objectName": f"{cert_name}_PrivateKey", "key": "tls.key"},
+            ]
+        }],
+        objects=[
+            {"objectName": cert_name, "objectAlias": f"{cert_name}_Certificate", "objectType": "cert", "objectVersion": ""},
+            {"objectName": cert_name, "objectAlias": f"{cert_name}_PrivateKey", "objectType": "secret", "objectVersion": ""},
+        ],
+    )
 
 
 def _generate_all_spcs(
@@ -479,13 +349,9 @@ def _generate_all_spcs(
 ) -> List[Dict[str, Any]]:
     """Generate all SecretProviderClass manifests."""
     spcs = []
-
-    click.echo(keyvaults_config)
-    
-    # Generate SPCs for regular keyvaults
     for kv_name, config in keyvaults_config.items():
         click.echo(f"  Generating SPC for {kv_name}")
-        spc = _generate_spc_for_keyvault(
+        spcs.append(_generate_spc_for_keyvault(
             keyvault_name=kv_name,
             secrets=config["secrets"],
             secret_name=config["secret_name"],
@@ -494,16 +360,11 @@ def _generate_all_spcs(
             namespace=namespace,
             project_name=project_name,
             secret_objects_config=config.get("secret_objects")
-        )
-        spcs.append(spc)
-    
-    # Generate certificate SPC if requested
+        ))
+
     if include_certificates_spc:
-        if not cert_name:
-            click.echo("Error: --cert-name required with --include-certificates-spc", err=True)
-            raise click.Abort()
         click.echo(f"  Generating certificate SPC for {aks_env}d9{SOCLE_KV_CODE}akv01")
-        spc = _generate_spc_for_certificates(
+        spcs.append(_generate_spc_for_certificates(
             tenant_id=tenant_id,
             identity_id=identity_id,
             namespace=namespace,
@@ -511,9 +372,8 @@ def _generate_all_spcs(
             env=aks_env,
             socle_code=SOCLE_KV_CODE,
             kube_secret_name=cert_kube_secret_name
-        )
-        spcs.append(spc)
-    
+        ))
+
     return spcs
 
 
@@ -525,133 +385,44 @@ def _generate_secret_keeper_pod(
     cert_kube_secret_name: str,
     include_certificates: bool = False,
     aks_env: Optional[str] = None,
-    socle_code: str = SOCLE_KV_CODE,
+    socle_code: Optional[str] = SOCLE_KV_CODE,
 ) -> Dict[str, Any]:
     """
     Generate a secret-keeper Deployment that mounts all SPCs.
-    
-    The deployment creates a pod that references one key from each keyvault's secret to trigger
+
+    The deployment creates a pod that references one key from each kube secret to trigger
     the Secrets Store CSI driver to create the Kubernetes secrets.
     """
     env_vars = []
     volume_mounts = []
     volumes = []
-    
+
     for kv_name, config in keyvaults_config.items():
-        # Check if docker-config-json exists in this keyvault
-        has_docker_config = "docker-config-json" in config["secrets"]
-        
-        # Handle environment variables based on custom secret objects or default
+        # One env var per kube secret, referencing its first key
         if config.get("secret_objects"):
-            # Custom secret objects: add env var for first secret from first object
             for obj_config in config["secret_objects"]:
                 obj_secrets = obj_config.get("secrets", [])
                 if obj_secrets:
-                    first_secret = obj_secrets[0]
-                    env_var_name = first_secret.upper().replace("-", "_")
-                    
-                    env_vars.append({
-                        "name": env_var_name,
-                        "valueFrom": {
-                            "secretKeyRef": {
-                                "name": obj_config.get("secret_name"),
-                                "key": env_var_name
-                            }
-                        }
-                    })
-
+                    key = _env_var_name(obj_secrets[0])
+                    env_vars.append(_secret_env_var(key, obj_config.get("secret_name"), key))
         else:
-            # Default behavior: use the first non-docker-config-json secret
-            if config["secrets"]:
-                regular_secrets = [s for s in config["secrets"] if s != "docker-config-json"]
-                if regular_secrets:
-                    first_secret = regular_secrets[0]
-                    env_var_name = first_secret.upper().replace("-", "_")
-                    
-                    env_vars.append({
-                        "name": env_var_name,
-                        "valueFrom": {
-                            "secretKeyRef": {
-                                "name": config["secret_name"],
-                                "key": env_var_name
-                            }
-                        }
-                    })
-        
-        # Add environment variable for docker-config-json if present
-        if has_docker_config:
-            env_vars.append({
-                "name": "DOCKER_CONFIG_JSON",
-                "valueFrom": {
-                    "secretKeyRef": {
-                        "name": f"{project_name}-secret-acr",
-                        "key": ".dockerconfigjson"
-                    }
-                }
-            })
-        
-        # Create volume mount
+            regular_secrets = [s for s in config["secrets"] if s != DOCKER_CONFIG_SECRET]
+            if regular_secrets:
+                key = _env_var_name(regular_secrets[0])
+                env_vars.append(_secret_env_var(key, config["secret_name"], key))
+
+        if DOCKER_CONFIG_SECRET in config["secrets"]:
+            env_vars.append(_secret_env_var("DOCKER_CONFIG_JSON", f"{project_name}-secret-acr", ".dockerconfigjson"))
+
         volume_name = f"{kv_name}-vol"
-        volume_mounts.append({
-            "name": volume_name,
-            "mountPath": config["mount_path"],
-            "readOnly": True
-        })
-        
-        # Create CSI volume
-        volumes.append({
-            "name": volume_name,
-            "csi": {
-                "driver": "secrets-store.csi.k8s.io",
-                "readOnly": True,
-                "volumeAttributes": {
-                    "secretProviderClass": config["spc_name"]
-                }
-            }
-        })
-    
-    click.echo(f"include certificates : {include_certificates}")
-    click.echo(f"aks env : {aks_env}")
+        volume_mounts.append({"name": volume_name, "mountPath": config["mount_path"], "readOnly": True})
+        volumes.append(_csi_volume(volume_name, config["spc_name"]))
 
-    # Add certificate volume and env var if requested
     if include_certificates and aks_env:
-        cert_spc_name = f"az-{aks_env}d9{socle_code}akv01-spc"
-        cert_secret_name = cert_kube_secret_name
-        cert_volume_name = "certs-vol"
-        
-        # Add environment variable referencing certificate secret
-        env_vars.append({
-            "name": "TLS_CERT",
-            "valueFrom": {
-                "secretKeyRef": {
-                    "name": cert_secret_name,
-                    "key": "tls.crt"
-                }
-            }
-        })
-        
-        # Add volume mount for certificates
-        volume_mounts.append({
-            "name": cert_volume_name,
-            "mountPath": "/mnt/certs",
-            "readOnly": True
-        })
-        
-        # Add CSI volume for certificates
-        volumes.append({
-            "name": cert_volume_name,
-            "csi": {
-                "driver": "secrets-store.csi.k8s.io",
-                "readOnly": True,
-                "volumeAttributes": {
-                    "secretProviderClass": cert_spc_name
-                }
-            }
-        })
+        env_vars.append(_secret_env_var("TLS_CERT", cert_kube_secret_name, "tls.crt"))
+        volume_mounts.append({"name": "certs-vol", "mountPath": "/mnt/certs", "readOnly": True})
+        volumes.append(_csi_volume("certs-vol", f"az-{aks_env}d9{socle_code}akv01-spc"))
 
-        click.echo(f"volumes : {volumes}")
-        click.echo(f"volumes mount : {volume_mounts}")
-    
     return {
         "kind": "Deployment",
         "apiVersion": "apps/v1",
@@ -700,50 +471,20 @@ def _write_manifests(
     aks_env: str
 ) -> None:
     """Write manifests to file(s) or stdout."""
-    if separate_files:
-        if not output:
-            click.echo("Error: --output directory required with --separate-files", err=True)
-            raise click.Abort()
-        
-        output_dir = Path(output).expanduser()
-        if not output_dir.is_dir() and output_dir.suffix:
-            output_dir = output_dir.parent
-        
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Write SPCs
-        spc_yaml = "---\n".join([
-            yaml.dump(spc, default_flow_style=False, sort_keys=False, width=4096, indent=2)
-            for spc in spcs
-        ])
-        spc_file = output_dir / f"{project_name}-{aks_env}-spcs.yaml"
-        spc_file.write_text(spc_yaml)
-        click.echo(f"✅ SecretProviderClass(es) written to: {spc_file}")
-        
-        # Write deployment
-        pod_yaml = yaml.dump(pod, default_flow_style=False, sort_keys=False, width=4096, indent=2)
-        pod_file = output_dir / f"{project_name}-{aks_env}-secret-keeper.yaml"
-        pod_file.write_text(pod_yaml)
-        click.echo(f"✅ Secret-keeper Deployment written to: {pod_file}")
-        
-    else:
-        # Combined output
-        all_manifests = spcs + [pod]
-        yaml_output = "---\n".join([
-            yaml.dump(manifest, default_flow_style=False, sort_keys=False, width=4096, indent=2)
-            for manifest in all_manifests
-        ])
-        
-        if output:
-            output_path = Path(output).expanduser()
-            if output_path.is_dir() or not output_path.suffix:
-                output_path = output_path / f"{project_name}-{aks_env}-akv-manifests.yaml"
-            
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(yaml_output)
-            click.echo(f"✅ All manifests written to: {output_path}")
-        else:
-            click.echo("\n" + yaml_output)
+    if not separate_files:
+        write_output(
+            dump_manifests(spcs + [pod]), output, f"{project_name}-{aks_env}-akv-manifests.yaml", "All manifests"
+        )
+        return
+
+    if not output:
+        raise click.UsageError("--output directory required with --separate-files")
+    output_dir = Path(output).expanduser()
+    if not output_dir.is_dir() and output_dir.suffix:
+        output_dir = output_dir.parent
+    write_output(dump_manifests(spcs), str(output_dir), f"{project_name}-{aks_env}-spcs.yaml", "SecretProviderClass(es)")
+    write_output(dump_manifests([pod]), str(output_dir), f"{project_name}-{aks_env}-secret-keeper.yaml", "Secret-keeper Deployment")
+
 
 def _backup_and_delete_existing_secrets(
     keyvaults_config: Dict[str, Dict[str, Any]],
@@ -753,91 +494,41 @@ def _backup_and_delete_existing_secrets(
     output: Optional[str]
 ) -> None:
     """
-    Check if secrets already exist in the namespace.
-    If they do, backup their manifests and delete them.
-    
-    Args:
-        keyvaults_config: Dictionary of keyvault configurations with secret_name
-        namespace: Kubernetes namespace
-        include_certificates_spc: Whether certificate SPC is included
-        output: Output path for backup files
+    Back up then delete the kube secrets the CSI driver will (re)create, if they already exist.
+
+    Backups are written to a `secret-backups` directory next to output (or in the cwd).
     """
-    # Collect all secret names that will be created by the CSI driver
     secret_names = []
-    
-    # Add secrets from keyvault configs
     for config in keyvaults_config.values():
-        # Check if custom secret objects are defined
         if config.get("secret_objects"):
-            # Add each custom secret object name
-            for obj_config in config["secret_objects"]:
-                secret_names.append(obj_config.get("secret_name"))
+            secret_names += [obj.get("secret_name") for obj in config["secret_objects"]]
         else:
-            # Add the default secret name
             secret_names.append(config["secret_name"])
-    
-    # Add certificate secret if enabled
     if include_certificates_spc:
         secret_names.append(cert_kube_secret_name)
-    
-    click.echo(f"\n{'='*60}")
-    click.echo("Checking for existing secrets...")
-    click.echo(f"{'='*60}\n")
-    
-    # Determine backup directory
+
+    banner("Checking for existing secrets...")
+
     if output:
         output_path = Path(output)
-        if output_path.is_dir():
-            backup_dir = output_path / "secret-backups"
-        else:
-            backup_dir = output_path.parent / "secret-backups"
+        backup_dir = (output_path if output_path.is_dir() else output_path.parent) / "secret-backups"
     else:
         backup_dir = Path.cwd() / "secret-backups"
-    
+
     for secret_name in secret_names:
-        try:
-            # Check if secret exists
-            result = run_cmd(
-                ["kubectl", "get", "secret", secret_name, "-n", namespace, "-o", "json"],
-                check=False,
-            )
+        existing = run_cmd(["kubectl", "get", "secret", secret_name, "-n", namespace, "-o", "json"], check=False)
+        if existing.returncode != 0:
+            click.echo(f"✓ No existing secret found: {secret_name}")
+            continue
 
-            if result.returncode == 0:
-                # Secret exists - backup and delete it
-                click.echo(f"⚠️  Found existing secret: {secret_name}")
+        click.echo(f"⚠️  Found existing secret: {secret_name}")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f"{secret_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.yaml"
+        backup_path.write_text(yaml.dump(json.loads(existing.stdout), default_flow_style=False))
+        click.echo(f"  ✓ Backed up to: {backup_path}")
 
-                # Parse the secret manifest
-                secret_manifest = json.loads(result.stdout)
-
-                # Create backup directory if needed
-                backup_dir.mkdir(parents=True, exist_ok=True)
-
-                # Generate backup filename with timestamp
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                backup_filename = f"{secret_name}_{timestamp}.yaml"
-                backup_path = backup_dir / backup_filename
-
-                # Write backup
-                with open(backup_path, 'w') as f:
-                    yaml.dump(secret_manifest, f, default_flow_style=False)
-
-                click.echo(f"  ✓ Backed up to: {backup_path}")
-
-                # Delete the secret
-                delete_result = run_cmd(
-                    ["kubectl", "delete", "secret", secret_name, "-n", namespace],
-                    check=False,
-                )
-
-                if delete_result.returncode == 0:
-                    click.echo(f"  ✓ Deleted existing secret: {secret_name}")
-                else:
-                    click.echo(f"  ⚠️  Warning: Could not delete secret: {delete_result.stderr}", err=True)
-            else:
-                # Secret doesn't exist - nothing to do
-                click.echo(f"✓ No existing secret found: {secret_name}")
-
-        except Exception as e:
-            click.echo(f"Warning: Error checking secret {secret_name}: {e}", err=True)
-            # Continue with other secrets
-
+        deleted = run_cmd(["kubectl", "delete", "secret", secret_name, "-n", namespace], check=False)
+        if deleted.returncode == 0:
+            click.echo(f"  ✓ Deleted existing secret: {secret_name}")
+        else:
+            click.echo(f"  ⚠️  Warning: Could not delete secret: {deleted.stderr}", err=True)

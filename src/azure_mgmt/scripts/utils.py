@@ -1,7 +1,9 @@
 """Utility functions for Azure management commands."""
 
+import click
 import yaml
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 
 class LiteralString(str):
@@ -33,3 +35,24 @@ def format_objects_array(objects: List[Dict[str, Any]]) -> LiteralString:
         lines.append(f'    objectType: {obj["objectType"]}')
         lines.append(f'    objectVersion: "{obj["objectVersion"]}"')
     return LiteralString("\n".join(lines) + "\n")
+
+
+def dump_manifests(manifests: List[Dict[str, Any]]) -> str:
+    """Serialize Kubernetes manifests as a multi-document YAML string."""
+    return "---\n".join(
+        yaml.dump(manifest, default_flow_style=False, sort_keys=False, width=4096, indent=2)
+        for manifest in manifests
+    )
+
+
+def write_output(content: str, output: Optional[str], default_filename: str, label: str) -> None:
+    """Write content to output (a file, or default_filename inside a directory), or stdout if None."""
+    if not output:
+        click.echo("\n" + content)
+        return
+    output_path = Path(output).expanduser()
+    if output_path.is_dir() or not output_path.suffix:
+        output_path = output_path / default_filename
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content)
+    click.echo(f"✅ {label} written to: {output_path}")
