@@ -6,7 +6,7 @@ import os
 import time
 from urllib import error, request
 from urllib.parse import quote
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import click
 
@@ -69,15 +69,6 @@ def _resolve_connection(profile: str) -> Tuple[str, str]:
     return host, token
 
 
-def _scim_lookup_id(host: str, account_id: str, token: str, resource: str, attribute: str, value: str) -> str:
-    """Return the ID of the SCIM resource (Users/Groups) whose attribute equals value."""
-    query = quote(f'{attribute} eq "{value}"')
-    resources = _api(host, token, f"/api/2.0/accounts/{account_id}/scim/v2/{resource}?filter={query}").get("Resources", [])
-    if not resources:
-        raise click.ClickException(f"{resource[:-1]} '{value}' not found")
-    return resources[0]["id"]
-
-
 @click.group()
 def databricks():
     """Databricks management commands"""
@@ -98,9 +89,22 @@ def patch_group_member(account_id: str, group: str, user: str, action: str, host
     token = token or _resolve_connection(profile)[1]
 
     click.secho(f"Looking up group '{group}'...", fg="cyan")
-    group_id = _scim_lookup_id(host, account_id, token, "Groups", "displayName", group)
+    groups = _api(
+        host, token,
+        f"/api/2.0/accounts/{account_id}/scim/v2/Groups?filter={quote('displayName eq ' + json.dumps(group))}",
+    ).get("Resources", [])
+    if not groups:
+        raise click.ClickException(f"Group '{group}' not found")
+    group_id = groups[0]["id"]
+
     click.secho(f"Looking up user '{user}'...", fg="cyan")
-    user_id = _scim_lookup_id(host, account_id, token, "Users", "userName", user)
+    users = _api(
+        host, token,
+        f"/api/2.0/accounts/{account_id}/scim/v2/Users?filter={quote('userName eq ' + json.dumps(user))}",
+    ).get("Resources", [])
+    if not users:
+        raise click.ClickException(f"User '{user}' not found")
+    user_id = users[0]["id"]
 
     if action == "add":
         operations = [{"op": "add", "path": "members", "value": [{"value": user_id}]}]
@@ -119,36 +123,6 @@ def patch_group_member(account_id: str, group: str, user: str, action: str, host
         click.echo(json.dumps(response, indent=2))
 
 
-def _find_job_id(host: str, token: str, job_name: str) -> int:
-    """Return the ID of the uniquely named Databricks job."""
-    jobs = _api(host, token, f"/api/2.1/jobs/list?name={quote(job_name)}").get("jobs", [])
-    exact_matches = [job for job in jobs if job.get("settings", {}).get("name") == job_name]
-    if not exact_matches:
-        raise click.ClickException(f"Databricks job '{job_name}' not found")
-    if len(exact_matches) > 1:
-        raise click.ClickException(f"Multiple Databricks jobs named '{job_name}' found")
-    return exact_matches[0]["job_id"]
-
-
-def _run_mount_job(host: str, token: str, job_name: str, params: dict, dry_run: bool) -> Optional[int]:
-    """Trigger the mount job with params as its `list_mount_point_string` notebook param."""
-    job_id = _find_job_id(host, token, job_name)
-    click.secho(f"  Job: {job_name} ({job_id})", fg="cyan")
-    click.secho("\n📋 Job payload list_mount_point_string:", fg="cyan")
-    click.echo(json.dumps(params, indent=2))
-    if dry_run:
-        click.secho("\n⚠️  [DRY RUN] Job not triggered.", fg="yellow")
-        return None
-
-    run_id = _api(
-        host, token, "/api/2.1/jobs/run-now",
-        method="POST",
-        body={"job_id": job_id, "notebook_params": {"list_mount_point_string": json.dumps(params)}},
-    )["run_id"]
-    click.secho(f"\n✅ Job triggered successfully — run_id: {run_id}", fg="green")
-    return run_id
-
-
 def _wait_for_run(host: str, token: str, run_id: int) -> dict:
     deadline = time.monotonic() + RUN_TIMEOUT_SECONDS
     previous_state = None
@@ -164,56 +138,6 @@ def _wait_for_run(host: str, token: str, run_id: int) -> dict:
         time.sleep(RUN_POLL_INTERVAL_SECONDS)
 
     raise click.ClickException(f"Run {run_id} did not finish within {RUN_TIMEOUT_SECONDS // 60} minutes")
-
-
-def _report_mount_jobs(runs: List[Tuple[str, str, int, str]]) -> None:
-    """Wait for each triggered run and report its outcome; abort if any failed."""
-    failed = False
-    for host, token, run_id, environment in runs:
-        click.secho(f"\n🌍 Checking {environment.upper()} run {run_id}", fg="magenta", bold=True)
-        try:
-            state = _wait_for_run(host, token, run_id).get("state", {})
-            result_state = state.get("result_state")
-            if result_state == "SUCCESS":
-                click.secho(f"✅ Run {run_id} completed successfully", fg="green")
-                continue
-
-            failed = True
-            state_message = state.get("state_message")
-            click.secho(f"❌ Run {run_id} failed: {result_state or state.get('life_cycle_state', 'UNKNOWN')}", fg="red", err=True)
-            if state_message:
-                click.echo(state_message, err=True)
-            output = _api(host, token, f"/api/2.1/jobs/runs/get-output?run_id={run_id}")
-            if output.get("error") and output["error"] != state_message:
-                click.echo(output["error"], err=True)
-            if output.get("error_trace"):
-                click.echo(output["error_trace"], err=True)
-        except click.ClickException as exc:
-            failed = True
-            click.secho(f"❌ Could not get result for run {run_id}: {exc.message}", fg="red", err=True)
-
-    if failed:
-        raise click.Abort()
-
-
-def _trigger_mounts(job_name: str, envs: Dict[str, Dict[str, Any]], connect, build_params, dry_run: bool) -> None:
-    """Pipeline shared by the mount commands: per env, connect → trigger job; then wait for all runs.
-
-    connect(env) returns (host, token); build_params(env, env_cfg) returns the job payload.
-    """
-    click.secho(f"\n{'='*60}", fg="cyan", bold=True)
-    click.secho(f"💡 Job name: {job_name} | Environments: {', '.join(envs)}", fg="cyan")
-    click.secho(f"{'='*60}", fg="cyan", bold=True)
-
-    runs = []
-    for env, env_cfg in envs.items():
-        click.secho(f"\n🌍 {env.upper()} ({env_cfg['name']})", fg="magenta", bold=True)
-        host, token = connect(env)
-        run_id = _run_mount_job(host, token, job_name, build_params(env, env_cfg), dry_run)
-        if run_id is not None:
-            runs.append((host, token, run_id, env))
-
-    _report_mount_jobs(runs)
 
 
 @databricks.command(name="mount-blob")
@@ -245,10 +169,20 @@ def mount_blob(
     """
     storage_account_suffix = strip_environment_prefix(storage_account)
 
-    def build_params(env: str, env_cfg: Dict[str, Any]) -> dict:
+    job_name = "Job_Mount_Blob_Serverless"
+    envs_config = resolve_environments(envs)
+    click.secho(f"\n{'='*60}", fg="cyan", bold=True)
+    click.secho(f"💡 Job name: {job_name} | Environments: {', '.join(envs_config)}", fg="cyan")
+    click.secho(f"{'='*60}", fg="cyan", bold=True)
+
+    # Trigger the job in every environment
+    runs = []
+    for env, env_cfg in envs_config.items():
+        click.secho(f"\n🌍 {env.upper()} ({env_cfg['name']})", fg="magenta", bold=True)
+        host, token = _resolve_connection(f"{env}{project_code}adb01")
         storage_account_name = f"{env}{storage_account_suffix}"
         click.secho(f"  Storage Account: {storage_account_name} | Container: {container} | Mount: {mount_path}", fg="cyan")
-        return {
+        params = {
             "config": {
                 "secretScope_name": f"SecretScope-{env}{project_code}-databricks",
             },
@@ -263,14 +197,55 @@ def mount_blob(
                 }
             ],
         }
+        jobs = _api(host, token, f"/api/2.1/jobs/list?name={quote(job_name)}").get("jobs", [])
+        exact_matches = [job for job in jobs if job.get("settings", {}).get("name") == job_name]
+        if not exact_matches:
+            raise click.ClickException(f"Databricks job '{job_name}' not found")
+        if len(exact_matches) > 1:
+            raise click.ClickException(f"Multiple Databricks jobs named '{job_name}' found")
+        job_id = exact_matches[0]["job_id"]
+        click.secho(f"  Job: {job_name} ({job_id})", fg="cyan")
+        click.secho("\n📋 Job payload list_mount_point_string:", fg="cyan")
+        click.echo(json.dumps(params, indent=2))
+        if dry_run:
+            click.secho("\n⚠️  [DRY RUN] Job not triggered.", fg="yellow")
+            continue
 
-    _trigger_mounts(
-        "Job_Mount_Blob_Serverless",
-        resolve_environments(envs),
-        connect=lambda env: _resolve_connection(f"{env}{project_code}adb01"),
-        build_params=build_params,
-        dry_run=dry_run,
-    )
+        run_id = _api(
+            host, token, "/api/2.1/jobs/run-now",
+            method="POST",
+            body={"job_id": job_id, "notebook_params": {"list_mount_point_string": json.dumps(params)}},
+        )["run_id"]
+        click.secho(f"\n✅ Job triggered successfully — run_id: {run_id}", fg="green")
+        runs.append((host, token, run_id, env))
+
+    # Wait for every triggered run and report its outcome
+    failed = False
+    for host, token, run_id, env in runs:
+        click.secho(f"\n🌍 Checking {env.upper()} run {run_id}", fg="magenta", bold=True)
+        try:
+            state = _wait_for_run(host, token, run_id).get("state", {})
+            result_state = state.get("result_state")
+            if result_state == "SUCCESS":
+                click.secho(f"✅ Run {run_id} completed successfully", fg="green")
+                continue
+
+            failed = True
+            state_message = state.get("state_message")
+            click.secho(f"❌ Run {run_id} failed: {result_state or state.get('life_cycle_state', 'UNKNOWN')}", fg="red", err=True)
+            if state_message:
+                click.echo(state_message, err=True)
+            output = _api(host, token, f"/api/2.1/jobs/runs/get-output?run_id={run_id}")
+            if output.get("error") and output["error"] != state_message:
+                click.echo(output["error"], err=True)
+            if output.get("error_trace"):
+                click.echo(output["error_trace"], err=True)
+        except click.ClickException as exc:
+            failed = True
+            click.secho(f"❌ Could not get result for run {run_id}: {exc.message}", fg="red", err=True)
+
+    if failed:
+        raise click.Abort()
 
 
 @databricks.command(name="mount-datalake")
@@ -302,11 +277,21 @@ def mount_datalake(
     connection = _resolve_connection(profile)
     datalake_suffix = strip_environment_prefix(datalake)
 
-    def build_params(env: str, env_cfg: Dict[str, Any]) -> dict:
+    job_name = "Job_Mount_Datalake_Serverless"
+    envs_config = resolve_environments(envs)
+    click.secho(f"\n{'='*60}", fg="cyan", bold=True)
+    click.secho(f"💡 Job name: {job_name} | Environments: {', '.join(envs_config)}", fg="cyan")
+    click.secho(f"{'='*60}", fg="cyan", bold=True)
+
+    # Trigger the job in every environment
+    runs = []
+    for env, env_cfg in envs_config.items():
+        click.secho(f"\n🌍 {env.upper()} ({env_cfg['name']})", fg="magenta", bold=True)
+        host, token = connection
         datalake_name = f"{env}{datalake_suffix}"
         env_display = env_cfg["name"]
         click.secho(f"  Datalake: {datalake_name} | Container: {container} | Mount: {mount_path}", fg="cyan")
-        return {
+        params = {
             "config": {
                 "clientId_key": f"{env}{project_code}spnadl-clientID",
                 "clientSecret_key": f"{env_display}{project_code}spnadl-secret",
@@ -320,11 +305,52 @@ def mount_datalake(
                 }
             ],
         }
+        jobs = _api(host, token, f"/api/2.1/jobs/list?name={quote(job_name)}").get("jobs", [])
+        exact_matches = [job for job in jobs if job.get("settings", {}).get("name") == job_name]
+        if not exact_matches:
+            raise click.ClickException(f"Databricks job '{job_name}' not found")
+        if len(exact_matches) > 1:
+            raise click.ClickException(f"Multiple Databricks jobs named '{job_name}' found")
+        job_id = exact_matches[0]["job_id"]
+        click.secho(f"  Job: {job_name} ({job_id})", fg="cyan")
+        click.secho("\n📋 Job payload list_mount_point_string:", fg="cyan")
+        click.echo(json.dumps(params, indent=2))
+        if dry_run:
+            click.secho("\n⚠️  [DRY RUN] Job not triggered.", fg="yellow")
+            continue
 
-    _trigger_mounts(
-        "Job_Mount_Datalake_Serverless",
-        resolve_environments(envs),
-        connect=lambda env: connection,
-        build_params=build_params,
-        dry_run=dry_run,
-    )
+        run_id = _api(
+            host, token, "/api/2.1/jobs/run-now",
+            method="POST",
+            body={"job_id": job_id, "notebook_params": {"list_mount_point_string": json.dumps(params)}},
+        )["run_id"]
+        click.secho(f"\n✅ Job triggered successfully — run_id: {run_id}", fg="green")
+        runs.append((host, token, run_id, env))
+
+    # Wait for every triggered run and report its outcome
+    failed = False
+    for host, token, run_id, env in runs:
+        click.secho(f"\n🌍 Checking {env.upper()} run {run_id}", fg="magenta", bold=True)
+        try:
+            state = _wait_for_run(host, token, run_id).get("state", {})
+            result_state = state.get("result_state")
+            if result_state == "SUCCESS":
+                click.secho(f"✅ Run {run_id} completed successfully", fg="green")
+                continue
+
+            failed = True
+            state_message = state.get("state_message")
+            click.secho(f"❌ Run {run_id} failed: {result_state or state.get('life_cycle_state', 'UNKNOWN')}", fg="red", err=True)
+            if state_message:
+                click.echo(state_message, err=True)
+            output = _api(host, token, f"/api/2.1/jobs/runs/get-output?run_id={run_id}")
+            if output.get("error") and output["error"] != state_message:
+                click.echo(output["error"], err=True)
+            if output.get("error_trace"):
+                click.echo(output["error_trace"], err=True)
+        except click.ClickException as exc:
+            failed = True
+            click.secho(f"❌ Could not get result for run {run_id}: {exc.message}", fg="red", err=True)
+
+    if failed:
+        raise click.Abort()

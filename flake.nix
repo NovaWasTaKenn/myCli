@@ -29,6 +29,8 @@
       propagatedBuildInputs = [
         pkgs.python313Packages.click
         pkgs.python313Packages.azure-servicebus
+        pkgs.python313Packages.azure-search-documents
+        pkgs.python313Packages.azure-identity
         pkgs.python313Packages.jmespath
         pkgs.python313Packages.pyyaml
         pkgs.ripgrep
@@ -51,6 +53,8 @@
         python313
         python313Packages.click
         python313Packages.azure-servicebus
+        python313Packages.azure-search-documents
+        python313Packages.azure-identity
         python313Packages.cock
         python313Packages.jmespath
         pythonNvim

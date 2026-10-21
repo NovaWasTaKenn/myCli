@@ -2,7 +2,7 @@
 
 import click
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Tuple
+from typing import Dict
 
 from helpers.azure import resolve_environments, set_subscription
 from helpers.shell import run_cmd_or_dry, run_json
@@ -31,140 +31,6 @@ SPN_TYPES: Dict[str, Dict[str, str]] = {
 def spn():
     """Service Principal management commands"""
     pass
-
-
-def _lookup_spn(spn_name: str, dry_run: bool) -> Tuple[str, str]:
-    """Return the (app_id, object_id) of an app registration (placeholders in dry-run)."""
-    if dry_run:
-        click.secho(f"⚠️  [DRY RUN] Would look up SPN: {spn_name}", fg="yellow")
-        return "00000000-0000-0000-0000-000000000000", "11111111-1111-1111-1111-111111111111"
-
-    spn_info = run_json(
-        ["az", "ad", "app", "list",
-         "--display-name", spn_name,
-         "--query", "[0].{appId:appId,objectId:id}",
-         "-o", "json"],
-        error_msg=f"Error looking up app '{spn_name}'",
-    ) or {}
-    app_id = (spn_info.get("appId") or "").strip()
-    object_id = (spn_info.get("objectId") or "").strip()
-
-    if not app_id or not object_id:
-        click.secho(f"❌ app '{spn_name}' not found", fg="red", err=True)
-        raise click.Abort()
-
-    click.secho(f"✅ Found app with App ID: {app_id}", fg="green")
-    click.secho(f"   Object ID: {object_id}", fg="white", dim=True)
-    return app_id, object_id
-
-
-def _reset_spn_credential(app_id: str, end_date_str: str, ttl: int, dry_run: bool) -> Tuple[str, str]:
-    """Reset the app credential and return (new_secret, credential_id) (placeholders in dry-run)."""
-    if dry_run:
-        click.secho(f"⚠️  [DRY RUN] Would reset app credential for App ID: {app_id} with end date: {end_date_str} ({ttl} days)", fg="yellow")
-        return "dry-run-secret-placeholder", "22222222-2222-2222-2222-222222222222"
-
-    new_secret = run_json(
-        ["az", "ad", "app", "credential", "reset", "--id", app_id, "--end-date", end_date_str, "-o", "json"],
-        error_msg="Error resetting credential",
-    ).get("password", "").strip()
-    if not new_secret:
-        click.secho("❌ Failed to generate new secret", fg="red", err=True)
-        raise click.Abort()
-    click.secho(f"✅ New secret generated successfully (expires: {end_date_str}, {ttl} days)", fg="green")
-
-    # Get the credential ID of the secret we just created (the one expiring last)
-    click.secho("   Fetching credential ID...", fg="white", dim=True)
-    credentials = run_json(
-        ["az", "ad", "app", "credential", "list", "--id", app_id, "-o", "json"],
-        error_msg="Error listing credentials",
-    )
-    if not credentials:
-        click.secho("⚠️  Warning: Could not retrieve credential ID", fg="yellow", err=True)
-        return new_secret, ""
-
-    latest = max(credentials, key=lambda c: c.get("endDateTime", ""))
-    credential_id = latest.get("keyId", "").strip()
-    click.secho(f"   Credential ID: {credential_id}", fg="white", dim=True)
-    return new_secret, credential_id
-
-
-def _store_secret(keyvault_name: str, secret_name: str, value: str, tags: list, dry_run: bool) -> None:
-    """Store a secret with metadata tags in a Key Vault."""
-    run_cmd_or_dry(
-        ["az", "keyvault", "secret", "set",
-         "--vault-name", keyvault_name,
-         "--name", secret_name,
-         "--value", value,
-         "--tags", *tags],
-        dry_run=dry_run,
-        dry_run_msg=(
-            f"Would store secret in: {keyvault_name}/{secret_name}\n"
-            f"   With tags: {', '.join(tags)}"
-        ),
-        error_msg=(
-            f"Error storing secret '{secret_name}' in Key Vault '{keyvault_name}' — "
-            "the value was generated but NOT stored; store it manually or retry"
-        ),
-        success_msg=f"Secret '{secret_name}' stored successfully in Key Vault",
-    )
-    click.secho(f"   Tags: {', '.join(tags)}", fg="white", dim=True)
-    if not dry_run and secret_name.endswith("clientID"):
-        click.secho(f"   Value: {value}", fg="white", dim=True)
-
-
-def _renew_secret_for_env(
-    env: str,
-    env_cfg: Dict[str, Any],
-    spn_config: Dict[str, str],
-    project_code: str,
-    ttl: int,
-    end_date_str: str,
-    store_appid: bool,
-    dry_run: bool,
-) -> None:
-    """Renew one SPN's secret in one environment. Aborts on error."""
-    spn_name = spn_config["name_pattern"].format(env=env, code=project_code)
-    keyvault_name = f"{env}d9{project_code}akv01"
-    secret_name = spn_config["secret_name"].format(env=env, code=project_code)
-
-    banner(f"🌍 Processing Environment: {env.upper()} ({env_cfg['name']})", fg="magenta", width=70)
-    click.secho(f"📝 SPN Name: {spn_name}", fg="white", bold=True)
-    click.secho(f"🔑 Key Vault: {keyvault_name}", fg="white", bold=True)
-    click.secho(f"🔒 Secret Name: {secret_name}\n", fg="white", bold=True)
-
-    set_subscription(env_cfg, dry_run)
-
-    click.secho(f"\n🔍 Looking up app '{spn_name}'...", fg="yellow")
-    app_id, object_id = _lookup_spn(spn_name, dry_run)
-
-    click.secho(f"\n🔄 Resetting app credential (expires in {ttl} day(s) on {end_date_str})...", fg="yellow")
-    new_secret, credential_id = _reset_spn_credential(app_id, end_date_str, ttl, dry_run)
-
-    click.secho(f"\n💾 Storing secret in Key Vault '{keyvault_name}' with metadata tags...", fg="yellow")
-    _store_secret(
-        keyvault_name,
-        secret_name,
-        new_secret,
-        [
-            f"ValidityPeriodDays={ttl}",
-            f"ProviderId={object_id}",
-            "Type=spn-secret",
-            f"CredentialId={credential_id}",
-        ],
-        dry_run,
-    )
-
-    if store_appid:
-        appid_secret_name = spn_config["appid_secret_name"].format(env=env, code=project_code)
-        click.secho(f"\n💾 Storing appId in Key Vault '{keyvault_name}'...", fg="yellow")
-        _store_secret(
-            keyvault_name,
-            appid_secret_name,
-            app_id,
-            [f"ProviderId={object_id}", "Type=spn-appid"],
-            dry_run,
-        )
 
 
 @spn.command()
@@ -224,8 +90,120 @@ def renew_secret(
 
     # Process each environment, skipping to the next one on error
     for env, env_cfg in envs.items():
+        spn_name = spn_config["name_pattern"].format(env=env, code=project_code)
+        keyvault_name = f"{env}d9{project_code}akv01"
+        secret_name = spn_config["secret_name"].format(env=env, code=project_code)
+
+        banner(f"🌍 Processing Environment: {env.upper()} ({env_cfg['name']})", fg="magenta", width=70)
+        click.secho(f"📝 SPN Name: {spn_name}", fg="white", bold=True)
+        click.secho(f"🔑 Key Vault: {keyvault_name}", fg="white", bold=True)
+        click.secho(f"🔒 Secret Name: {secret_name}\n", fg="white", bold=True)
+
         try:
-            _renew_secret_for_env(env, env_cfg, spn_config, project_code, ttl, end_date_str, store_appid, dry_run)
+            set_subscription(env_cfg, dry_run)
+
+            # 1. Look up the app registration (placeholders in dry-run)
+            click.secho(f"\n🔍 Looking up app '{spn_name}'...", fg="yellow")
+            if dry_run:
+                click.secho(f"⚠️  [DRY RUN] Would look up SPN: {spn_name}", fg="yellow")
+                app_id, object_id = "00000000-0000-0000-0000-000000000000", "11111111-1111-1111-1111-111111111111"
+            else:
+                spn_info = run_json(
+                    ["az", "ad", "app", "list",
+                     "--display-name", spn_name,
+                     "--query", "[0].{appId:appId,objectId:id}",
+                     "-o", "json"],
+                    error_msg=f"Error looking up app '{spn_name}'",
+                ) or {}
+                app_id = (spn_info.get("appId") or "").strip()
+                object_id = (spn_info.get("objectId") or "").strip()
+                if not app_id or not object_id:
+                    click.secho(f"❌ app '{spn_name}' not found", fg="red", err=True)
+                    raise click.Abort()
+                click.secho(f"✅ Found app with App ID: {app_id}", fg="green")
+                click.secho(f"   Object ID: {object_id}", fg="white", dim=True)
+
+            # 2. Reset the app credential (generates the new secret) and find its credential ID (placeholders in dry-run)
+            click.secho(f"\n🔄 Resetting app credential (expires in {ttl} day(s) on {end_date_str})...", fg="yellow")
+            if dry_run:
+                click.secho(f"⚠️  [DRY RUN] Would reset app credential for App ID: {app_id} with end date: {end_date_str} ({ttl} days)", fg="yellow")
+                new_secret, credential_id = "dry-run-secret-placeholder", "22222222-2222-2222-2222-222222222222"
+            else:
+                new_secret = run_json(
+                    ["az", "ad", "app", "credential", "reset", "--id", app_id, "--end-date", end_date_str, "-o", "json"],
+                    error_msg="Error resetting credential",
+                ).get("password", "").strip()
+                if not new_secret:
+                    click.secho("❌ Failed to generate new secret", fg="red", err=True)
+                    raise click.Abort()
+                click.secho(f"✅ New secret generated successfully (expires: {end_date_str}, {ttl} days)", fg="green")
+
+                # The credential we just created is the one expiring last
+                click.secho("   Fetching credential ID...", fg="white", dim=True)
+                credentials = run_json(
+                    ["az", "ad", "app", "credential", "list", "--id", app_id, "-o", "json"],
+                    error_msg="Error listing credentials",
+                )
+                credential_id = ""
+                if credentials:
+                    latest = max(credentials, key=lambda c: c.get("endDateTime", ""))
+                    credential_id = latest.get("keyId", "").strip()
+                    click.secho(f"   Credential ID: {credential_id}", fg="white", dim=True)
+                else:
+                    click.secho("⚠️  Warning: Could not retrieve credential ID", fg="yellow", err=True)
+
+            # 3. Store the secret in the Key Vault
+            click.secho(f"\n💾 Storing secret in Key Vault '{keyvault_name}' with metadata tags...", fg="yellow")
+            secret_tags = [
+                f"ValidityPeriodDays={ttl}",
+                f"ProviderId={object_id}",
+                "Type=spn-secret",
+                f"CredentialId={credential_id}",
+            ]
+            run_cmd_or_dry(
+                ["az", "keyvault", "secret", "set",
+                 "--vault-name", keyvault_name,
+                 "--name", secret_name,
+                 "--value", new_secret,
+                 "--tags", *secret_tags],
+                dry_run=dry_run,
+                dry_run_msg=(
+                    f"Would store secret in: {keyvault_name}/{secret_name}\n"
+                    f"   With tags: {', '.join(secret_tags)}"
+                ),
+                error_msg=(
+                    f"Error storing secret '{secret_name}' in Key Vault '{keyvault_name}' — "
+                    "the value was generated but NOT stored; store it manually or retry"
+                ),
+                success_msg=f"Secret '{secret_name}' stored successfully in Key Vault",
+            )
+            click.secho(f"   Tags: {', '.join(secret_tags)}", fg="white", dim=True)
+
+            # 4. Optionally store the appId in the Key Vault
+            if store_appid:
+                appid_secret_name = spn_config["appid_secret_name"].format(env=env, code=project_code)
+                appid_tags = [f"ProviderId={object_id}", "Type=spn-appid"]
+                click.secho(f"\n💾 Storing appId in Key Vault '{keyvault_name}'...", fg="yellow")
+                run_cmd_or_dry(
+                    ["az", "keyvault", "secret", "set",
+                     "--vault-name", keyvault_name,
+                     "--name", appid_secret_name,
+                     "--value", app_id,
+                     "--tags", *appid_tags],
+                    dry_run=dry_run,
+                    dry_run_msg=(
+                        f"Would store secret in: {keyvault_name}/{appid_secret_name}\n"
+                        f"   With tags: {', '.join(appid_tags)}"
+                    ),
+                    error_msg=(
+                        f"Error storing secret '{appid_secret_name}' in Key Vault '{keyvault_name}' — "
+                        "the value was generated but NOT stored; store it manually or retry"
+                    ),
+                    success_msg=f"Secret '{appid_secret_name}' stored successfully in Key Vault",
+                )
+                click.secho(f"   Tags: {', '.join(appid_tags)}", fg="white", dim=True)
+                if not dry_run:
+                    click.secho(f"   Value: {app_id}", fg="white", dim=True)
         except click.Abort:
             click.secho(f"⚠️  Skipping environment {env.upper()} due to previous error", fg="yellow", err=True)
             continue
