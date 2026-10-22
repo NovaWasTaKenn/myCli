@@ -6,7 +6,7 @@ from typing import Optional
 
 from helpers.azure import resolve_environments, set_subscription, strip_environment_prefix
 from helpers.config import require_config
-from helpers.shell import run_cmd_or_dry, run_idempotent, run_text
+from helpers.shell import run_cmd_or_dry, run_json, run_text
 from helpers.ui import banner
 
 
@@ -173,22 +173,27 @@ def create_ingestion_folders(
 
         for root_folder in root_folders:
             folder_path = f"{root_folder}/{project_folder_name}"
-            click.secho(f"  📁 Creating folder: {folder_path}", fg="bright_cyan", bold=True)
-            try:
-                run_idempotent(
-                    ["az", "storage", "fs", "directory", "create",
-                     "--name", folder_path,
-                     "--file-system", filesystem,
-                     "--account-name", storage_account],
-                    exists_markers=["PathAlreadyExists", "already exists"],
-                    dry_run=dry_run,
-                    dry_run_msg=f"Would create directory: {folder_path}",
-                    error_msg="Error creating folder",
-                    success_msg="Folder created successfully",
-                    exists_msg="Folder already exists (skipping)",
-                )
-            except click.Abort:
-                click.secho("    ⚠️  Continuing with next folder...", fg="yellow", err=True)
+            click.secho(f"  📁 Checking folder: {folder_path}", fg="bright_cyan", bold=True)
+            exists_result = run_json(
+                ["az", "storage", "fs", "directory", "exists",
+                 "--name", folder_path,
+                 "--file-system", filesystem,
+                 "--account-name", storage_account],
+                error_msg=f"Error checking existence of folder: {folder_path}",
+            )
+            if exists_result and exists_result.get("exists"):
+                click.secho(f"  ❌ Folder already exists: {folder_path}", fg="red", err=True)
+                raise click.Abort()
+            run_cmd_or_dry(
+                ["az", "storage", "fs", "directory", "create",
+                 "--name", folder_path,
+                 "--file-system", filesystem,
+                 "--account-name", storage_account],
+                dry_run=dry_run,
+                dry_run_msg=f"Would create directory: {folder_path}",
+                error_msg="Error creating folder",
+                success_msg="Folder created successfully",
+            )
 
     click.secho("\n" + "="*60, fg="cyan", bold=True)
     if dry_run:
@@ -250,6 +255,17 @@ def setup_blob_container(
             fg="cyan",
         )
 
+        container_check = run_json(
+            ["az", "storage", "container", "exists",
+             "--name", container_name,
+             "--account-name", storage_account_name,
+             "--auth-mode", "login"],
+            error_msg="Error checking container existence",
+        )
+        if container_check and container_check.get("exists"):
+            click.secho(f"  ❌ Container '{container_name}' already exists in '{storage_account_name}'", fg="red", err=True)
+            raise click.Abort()
+
         click.secho("📦 Step 1: Creating blob container...", fg="bright_cyan", bold=True)
         run_cmd_or_dry(
             ["az", "storage", "container", "create", "--name", container_name,
@@ -285,15 +301,13 @@ def setup_blob_container(
             (readers_name, readers_oid, readers_role),
         ]:
             click.secho(f"  🔧 '{role}' → {group_name}...", fg="yellow")
-            run_idempotent(
+            run_cmd_or_dry(
                 ["az", "role", "assignment", "create",
                  "--assignee", group_oid, "--role", role, "--scope", container_scope],
-                exists_markers=["RoleAssignmentExists", "already exists"],
                 dry_run=dry_run,
                 dry_run_msg=f"Would assign role to OID {group_oid} at scope {container_scope}",
                 error_msg="Error assigning role",
                 success_msg="Role assigned",
-                exists_msg="Role assignment already exists (skipping)",
             )
 
         account_key_result = run_cmd_or_dry(
