@@ -21,7 +21,7 @@ def quick(name, pane, work):
     vault = WORK_VAULT if work else PERSONAL_VAULT
     tmux_target = ["split-window", "-v"] if pane else ["new-window"]
     run_cmd(
-        ["tmux", *tmux_target, "-c", str(vault), f'nvim "+ObsidianNew {name}"'],
+        ["tmux", *tmux_target, "-c", str(vault), f'nvim "+Obsidian new {name}"'],
         error_msg="Failed to open note in tmux",
     )
 
