@@ -4,6 +4,8 @@ from pathlib import Path
 from helpers.shell import run_cmd
 
 TEMPLATES_DIR = Path.home() / ".dotfiles/modules/home-manager/cli/src/obsidian/pandoc/templates"
+PERSONAL_VAULT = Path.home() / "Documents/personal"
+WORK_VAULT = Path.home() / "Documents/work"
 
 
 @click.group()
@@ -14,9 +16,14 @@ def notes():
 @notes.command()
 @click.argument("name")
 @click.option("--pane", is_flag=True, help="Use a pane instead of a window.")
-def quick(name, pane):
+@click.option("--work", is_flag=True, help="Open the note in the work vault instead of personal.")
+def quick(name, pane, work):
+    vault = WORK_VAULT if work else PERSONAL_VAULT
     tmux_target = ["split-window", "-v"] if pane else ["new-window"]
-    run_cmd(["tmux", *tmux_target, f'nvim "+ObsidianNew {name}"'], error_msg="Failed to open note in tmux")
+    run_cmd(
+        ["tmux", *tmux_target, "-c", str(vault), f'nvim "+ObsidianNew {name}"'],
+        error_msg="Failed to open note in tmux",
+    )
 
 
 @notes.command()

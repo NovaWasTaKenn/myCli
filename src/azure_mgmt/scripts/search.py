@@ -59,6 +59,7 @@ def _strip_search_metadata(document: Dict[str, Any]) -> Dict[str, Any]:
 @click.option("--source-index", required=True, help="Name of the index to copy from the source service.")
 @click.option("--target-service", required=True, help="Target search service name, or a full endpoint URL.")
 @click.option("--target-index", help="Name of the index to create/overwrite on the target service. Defaults to --source-index.")
+@click.option("--foundry-name", help="Name of the foundry service used for vectorization on the target")
 @click.option("--search-suffix", default=DEFAULT_SEARCH_SUFFIX, show_default=True, help="Domain suffix used when building endpoints from bare service names (e.g. for sovereign clouds).")
 @click.option("--select", help="Comma-separated list of fields to copy. Defaults to all retrievable fields.")
 @click.option("--batch-size", default=DEFAULT_BATCH_SIZE, show_default=True, type=click.IntRange(1, MAX_BATCH_SIZE), help="Documents per indexing batch.")
@@ -73,6 +74,7 @@ def copy_index(
     target_index: Optional[str],
     search_suffix: str,
     select: Optional[str],
+    foundry_name: Optional[str],
     batch_size: int,
     recreate_index: bool,
     skip_documents: bool,
@@ -149,6 +151,24 @@ def copy_index(
 
     target_definition = copy.deepcopy(source_definition)
     target_definition.name = target_index
+
+    
+    if foundry_name: 
+        vectorizers = target_definition.vector_search.vectorizers
+
+        if len(vectorizers) > 0 : click.secho(f"⚠️ Script excepts just one vectorizers, found {len(vectorizers)}, applying foundry_name to first vectorizer only", fg="yellow")
+        if len(vectorizers) <= 0 : raise click.ClickException(f"Script excepts one vectorizer, found 0. Aborting")
+
+        target_vectorizer = vectorizers[0]
+
+        if target_vectorizer.kind != "azureOpenAI": click.ClickException(f"Vectorizer is not an azureOpenAI type vectorizer")
+
+        replacement = f"https://{foundry_name}.openai.azure.com"
+        click.secho(f"Replacing target_definition's vectorizer resourceUri : {target_vectorizer.parameters.resource_url} -> {replacement}")
+
+        target_vectorizer.parameters.resource_url = f"https://{foundry_name}.openai.azure.com"
+
+
     if getattr(target_definition, "encryption_key", None):
         click.secho(
             "⚠️  Source index uses a customer-managed encryption key tied to its own Key Vault; "
@@ -205,7 +225,7 @@ def copy_index(
             f"Uploaded batch of {len(batch)} ({len(batch) - len(batch_failed)} ok, {len(batch_failed)} failed) in {elapsed:.1f}s"
         )
 
-    _log_progress(f"Done; copied {copied}/{total_count} document(s), {len(failed)} failure(s)")
+    if not dry_run: _log_progress(f"Done; copied {copied}/{total_count} document(s), {len(failed)} failure(s)")
 
     if failed:
         for failure in failed[:20]:
@@ -214,7 +234,10 @@ def copy_index(
             click.secho(f"  ... and {len(failed) - 20} more", fg="red", err=True)
         raise click.ClickException(f"{len(failed)} document(s) failed to copy")
 
-    click.secho(f"✅ Copied {copied} document(s) to '{target_index}' on {target_endpoint}", fg="green")
+    if dry_run: 
+        click.secho(f"⚠️  [DRY RUN] Would Copy {copied} document(s) to '{target_index}' on {target_endpoint}", fg="yellow")
+    else: 
+        click.secho(f"✅ Copied {copied} document(s) to '{target_index}' on {target_endpoint}", fg="green")
 
 
 def _import_indexer_sdk():

@@ -3,23 +3,14 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
-    nvimConfigs = {
-      url = "github:NovaWasTakenn/nvimConfigs/main";
-      inputs.nixpkgs.follows = "nixpkgs"; # Suis le nixpkgs défini précédemment ou alors nixpkgs alias nix unstable ????
-    };
   };
 
   outputs = inputs @ {...}: let
     system = "x86_64-linux";
     pkgs = import inputs.nixpkgs {
       system = system;
-      overlays = [
-        (final: prev: {
-          pythonNvim = inputs.nvimConfigs.packages.${system}.pythonNvim;
-        })
-      ];
     };
-    
+
     myCli = pkgs.python3Packages.buildPythonPackage rec {
       pname = "nova-cli";
       version = "0.1.0";
@@ -57,7 +48,6 @@
         python313Packages.azure-identity
         python313Packages.cock
         python313Packages.jmespath
-        pythonNvim
       ];
 
       shellHook = "echo 'Welcome to a python dev env'";
