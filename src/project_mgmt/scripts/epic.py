@@ -5,7 +5,7 @@ from typing import Optional
 import click
 
 from project_mgmt.scripts import notes as note_helpers
-from project_mgmt.scripts.vault import epic_dir, epic_note_path, project_note_path, slugify
+from project_mgmt.scripts.vault import epic_dir, epic_note_path, project_note_path, require_current_project, slugify
 
 
 @click.group()
@@ -44,12 +44,65 @@ def start_epic(name: str, project_slug: str, deadline: Optional[str] = None, *, 
     return epic_slug
 
 
+def _require_epic(project_slug: str, epic_slug: str) -> None:
+    if not epic_note_path(project_slug, epic_slug).exists():
+        raise click.ClickException(
+            f"Epic '{epic_slug}' does not exist under project '{project_slug}'. "
+            f"Run `mycli project epic start {epic_slug} --project={project_slug}` first."
+        )
+
+
+_PROJECT_OPTION_HELP = (
+    "Project slug the epic belongs to. Defaults to the current project "
+    "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name)."
+)
+
+
+@epic.command()
+@click.argument("epic_slug")
+@click.option("--project", "project_slug", help=_PROJECT_OPTION_HELP)
+def prd(epic_slug: str, project_slug: Optional[str]):
+    """Open the epic's PRD/plan note, creating it from the planning template if missing."""
+    project_slug = require_current_project(project_slug)
+    _require_epic(project_slug, epic_slug)
+    path = epic_dir(project_slug, epic_slug) / "docs" / "planning" / "_prd.md"
+    note_helpers.open_or_create(
+        path,
+        slug=f"{epic_slug}-prd",
+        tags=["doc", "doc/planning"],
+        project=project_slug,
+        epic=epic_slug,
+        template="planning.md",
+        title=epic_slug.replace("-", " ").title(),
+    )
+
+
+@epic.command()
+@click.argument("epic_slug")
+@click.option("--project", "project_slug", help=_PROJECT_OPTION_HELP)
+def scratchpad(epic_slug: str, project_slug: Optional[str]):
+    """Open the epic's scratchpad note (one per epic), creating it from the scratchpad template if missing."""
+    project_slug = require_current_project(project_slug)
+    _require_epic(project_slug, epic_slug)
+    path = epic_dir(project_slug, epic_slug) / "docs" / "realisation" / "_scratchpad.md"
+    note_helpers.open_or_create(
+        path,
+        slug=f"{epic_slug}-scratchpad",
+        tags=["doc", "doc/realisation"],
+        project=project_slug,
+        epic=epic_slug,
+        template="scratchpad.md",
+        title=epic_slug.replace("-", " ").title(),
+    )
+
+
 @epic.command()
 @click.argument("name")
-@click.option("--project", "project_slug", required=True, help="Project slug the epic belongs to.")
+@click.option("--project", "project_slug", help=_PROJECT_OPTION_HELP)
 @click.option("--deadline", help="Optional deadline, YYYY-MM-DD.")
-def start(name: str, project_slug: str, deadline: Optional[str]):
+def start(name: str, project_slug: Optional[str], deadline: Optional[str]):
     """Start a new epic under an existing project: folder structure, note, and a link from the project."""
+    project_slug = require_current_project(project_slug)
     if not project_note_path(project_slug).exists():
         raise click.ClickException(
             f"Project '{project_slug}' does not exist. Run `mycli project init {project_slug}` first."

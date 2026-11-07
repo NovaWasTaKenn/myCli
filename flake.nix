@@ -51,11 +51,10 @@
         python313Packages.jmespath
         python313Packages.pyyaml
         python313Packages.requests
-        pythonNvim
       ];
 
       shellHook = "echo 'Welcome to a python dev env'";
-      #ENV_VAR = "";
+            #PROJECT_MGMT_PROJECT = "mycli";
     };
 
     packages.${system} = {

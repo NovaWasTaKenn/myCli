@@ -4,21 +4,17 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from helpers.config import get_config
+import click
+
+from helpers.config import require_config, get_config
 
 PROJECTS_SUBDIR = "20-Projects"
 
-_WORKSPACES = {
-    "personal": "~/Documents/personal",
-    "work": "~/Documents/work",
-}
 
 
-def vault_root(workspace: Optional[str] = None) -> Path:
+def vault_root() -> Path:
     """Resolve the vault root. `workspace` overrides project_mgmt.vault_path for one-off use."""
-    if workspace:
-        return Path(_WORKSPACES[workspace]).expanduser()
-    return Path(get_config("project_mgmt.vault_path", default=_WORKSPACES["personal"])).expanduser()
+    return Path(require_config("project_mgmt.vault_path")).expanduser()
 
 
 def templates_root() -> Path:
@@ -33,12 +29,47 @@ def slugify(title: str) -> str:
     return slug
 
 
-def project_dir(project_slug: str, workspace: Optional[str] = None) -> Path:
-    return vault_root(workspace) / PROJECTS_SUBDIR / project_slug
+def _git_root(start: Optional[Path] = None) -> Optional[Path]:
+    """Walk up from `start` (default cwd) to the nearest directory holding a
+    `.git` entry - a repo's `.git` dir, or a submodule's `.git` file."""
+    current = (start or Path.cwd()).resolve()
+    for directory in (current, *current.parents):
+        if (directory / ".git").exists():
+            return directory
+    return None
 
 
-def project_note_path(project_slug: str, workspace: Optional[str] = None) -> Path:
-    return project_dir(project_slug, workspace) / "_project.md"
+def current_project() -> Optional[str]:
+    """Resolve the current project slug, or None if it can't be determined.
+
+    Precedence: `project_mgmt.project` - which, via the existing config
+    lookup, is overridable by the $PROJECT_MGMT_PROJECT env var - then the
+    name of the nearest enclosing git repo or submodule (walking up from cwd).
+    """
+    configured = get_config("project_mgmt.project")
+    if configured:
+        return slugify(str(configured))
+    root = _git_root()
+    return slugify(root.name) if root else None
+
+
+def require_current_project(project_slug: Optional[str] = None) -> str:
+    """Return project_slug, defaulting to current_project(); raises click.UsageError if neither resolves."""
+    project_slug = project_slug or current_project()
+    if not project_slug:
+        raise click.UsageError(
+            "Could not determine the current project. Pass --project, set project_mgmt.project, "
+            "or run this from inside the project's git repo."
+        )
+    return project_slug
+
+
+def project_dir(project_slug: str) -> Path:
+    return vault_root() / PROJECTS_SUBDIR / project_slug
+
+
+def project_note_path(project_slug: str) -> Path:
+    return project_dir(project_slug) / "_project.md"
 
 
 def epic_dir(project_slug: str, epic_slug: str) -> Path:
@@ -49,8 +80,16 @@ def epic_note_path(project_slug: str, epic_slug: str) -> Path:
     return epic_dir(project_slug, epic_slug) / "_epic.md"
 
 
-def find_task_path(task_slug: str) -> Optional[Path]:
-    """Locate a task note by slug anywhere under the vault's projects tree."""
+def find_task_path(project_slug: str, task_slug: str) -> Optional[Path]:
+    """Locate a task note by slug within a project (standalone, or under any of its epics)."""
+    base = project_dir(project_slug)
+    if not base.is_dir():
+        return None
+    matches = sorted(base.glob(f"tasks/{task_slug}.md")) + sorted(base.glob(f"epics/*/tasks/{task_slug}.md"))
+    return matches[0] if matches else None
+
+def find_scratchpad_path(scratchpad_slug: str) -> Optional[Path]:
+    """Locate a scratchpad note by slug anywhere under the vault's projects tree."""
     root = vault_root() / PROJECTS_SUBDIR
     if not root.is_dir():
         return None
@@ -58,3 +97,5 @@ def find_task_path(task_slug: str) -> Optional[Path]:
         root.glob(f"*/epics/*/tasks/{task_slug}.md")
     )
     return matches[0] if matches else None
+
+

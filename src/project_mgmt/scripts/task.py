@@ -9,7 +9,9 @@ from helpers.config import get_config
 from helpers.shell import run_cmd
 from project_mgmt.scripts import jira, notes as note_helpers
 from project_mgmt.scripts.epic import start_epic
-from project_mgmt.scripts.vault import epic_dir, epic_note_path, find_task_path, project_dir, slugify
+from project_mgmt.scripts.vault import (
+    epic_dir, epic_note_path, find_task_path, project_dir, require_current_project, slugify,
+)
 
 
 @click.group()
@@ -24,7 +26,11 @@ def _local_states() -> List[str]:
 
 @task.command()
 @click.argument("title")
-@click.option("--project", "project_slug", required=True, help="Project slug the task belongs to.")
+@click.option(
+    "--project", "project_slug",
+    help="Project slug the task belongs to. Defaults to the current project "
+    "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name).",
+)
 @click.option("--epic", "epic_name", help="Epic name or slug; created automatically if it doesn't exist.")
 @click.option("--deadline", help="Optional deadline, YYYY-MM-DD.")
 @click.option("--description", "edit_description", is_flag=True, help="Open $EDITOR to write a description.")
@@ -36,7 +42,7 @@ def _local_states() -> List[str]:
 @click.option("--story-points", type=int, help="Story points; only used when jira.enabled is true.")
 def create(
     title: str,
-    project_slug: str,
+    project_slug: Optional[str],
     epic_name: Optional[str],
     deadline: Optional[str],
     edit_description: bool,
@@ -51,6 +57,7 @@ def create(
     """
     if edit_description and stdin_description:
         raise click.UsageError("Use either --description or --description-stdin, not both.")
+    project_slug = require_current_project(project_slug)
     if not project_dir(project_slug).exists():
         raise click.ClickException(
             f"Project '{project_slug}' does not exist. Run `mycli project init {project_slug}` first."
@@ -101,15 +108,21 @@ def create(
 @task.command("status")
 @click.argument("task_slug")
 @click.argument("new_state")
-def set_status(task_slug: str, new_state: str):
+@click.option(
+    "--project", "project_slug",
+    help="Project slug the task belongs to. Defaults to the current project "
+    "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name).",
+)
+def set_status(task_slug: str, new_state: str, project_slug: Optional[str]):
     """Change a task's local completion state (and its Jira state, if synced)."""
     states = _local_states()
     if new_state not in states:
         raise click.UsageError(f"'{new_state}' is not a configured state. Choose from: {', '.join(states)}")
 
-    task_path = find_task_path(task_slug)
+    project_slug = require_current_project(project_slug)
+    task_path = find_task_path(project_slug, task_slug)
     if task_path is None:
-        raise click.ClickException(f"No task found with slug '{task_slug}'")
+        raise click.ClickException(f"No task found with slug '{task_slug}' in project '{project_slug}'")
 
     note_helpers.update_status_tag(task_path, new_state)
     click.secho(f"✅ {task_slug} -> {new_state}", fg="green")
@@ -123,9 +136,15 @@ def set_status(task_slug: str, new_state: str):
 
 @task.command("open")
 @click.argument("task_slug")
-def open_task(task_slug: str):
+@click.option(
+    "--project", "project_slug",
+    help="Project slug the task belongs to. Defaults to the current project "
+    "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name).",
+)
+def open_task(task_slug: str, project_slug: Optional[str]):
     """Open a task note in the editor."""
-    task_path = find_task_path(task_slug)
+    project_slug = require_current_project(project_slug)
+    task_path = find_task_path(project_slug, task_slug)
     if task_path is None:
-        raise click.ClickException(f"No task found with slug '{task_slug}'")
+        raise click.ClickException(f"No task found with slug '{task_slug}' in project '{project_slug}'")
     run_cmd(["tmux", "new-window", f'nvim "{task_path}"'], error_msg="Failed to open task note in tmux")

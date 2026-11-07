@@ -10,8 +10,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple
 
+import click
 import yaml
 
+from helpers.shell import run_cmd
 from project_mgmt.scripts.vault import templates_root
 
 
@@ -47,6 +49,23 @@ def write_note(path: Path, frontmatter: str, body: str) -> None:
         raise FileExistsError(f"Note already exists: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(frontmatter + "\n" + body.rstrip() + "\n")
+
+
+def open_in_editor(path: Path) -> None:
+    """Open path in nvim via a new tmux window (mirrors `mycli notes quick`)."""
+    run_cmd(["tmux", "new-window", f'nvim "{path}"'], error_msg="Failed to open note in tmux")
+
+
+def open_or_create(
+    path: Path, *, slug: str, tags: Iterable[str], template: str, title: str, **extra_fields: Any,
+) -> None:
+    """Open path in the editor, creating it from `template` first if it doesn't exist yet."""
+    if not path.exists():
+        frontmatter = build_frontmatter(slug=slug, tags=tags, **extra_fields)
+        body = render_template(template, title=title)
+        write_note(path, frontmatter, body)
+        click.secho(f"✅ Created {path}", fg="green")
+    open_in_editor(path)
 
 
 def read_frontmatter(path: Path) -> Tuple[Dict[str, Any], str]:

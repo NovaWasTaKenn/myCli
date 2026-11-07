@@ -7,7 +7,8 @@ import click
 from project_mgmt.scripts import notes as note_helpers
 from project_mgmt.scripts.epic import epic
 from project_mgmt.scripts.task import task
-from project_mgmt.scripts.vault import project_dir, project_note_path, slugify
+from project_mgmt.scripts.vault import project_dir, project_note_path, slugify, require_current_project
+
 
 
 @click.group()
@@ -17,16 +18,13 @@ def project():
 
 
 @project.command()
-@click.argument("name")
-@click.option(
-    "--vault", "workspace", type=click.Choice(["personal", "work"]),
-    help="Vault workspace to create the project in; defaults to project_mgmt.vault_path.",
-)
-def init(name: str, workspace: Optional[str]):
+@click.option("--name", default=None, help="The name of the project")
+def init(name: Optional[str]):
     """Initialize a new project's folder structure and main note."""
-    project_slug = slugify(name)
-    directory = project_dir(project_slug, workspace)
-    note_path = project_note_path(project_slug, workspace)
+    name = name if name is not None else require_current_project()
+    project_slug  = slugify(name)
+    directory = project_dir(project_slug)
+    note_path = project_note_path(project_slug)
     if note_path.exists():
         raise click.ClickException(f"Project '{project_slug}' already exists at {note_path}")
 
@@ -39,13 +37,6 @@ def init(name: str, workspace: Optional[str]):
 
     click.secho(f"✅ Created project '{project_slug}'", fg="green")
     click.echo(str(note_path))
-    if workspace:
-        click.secho(
-            f"ℹ️  Created in the '{workspace}' vault. Other project/epic/task commands use "
-            f"project_mgmt.vault_path from config - set it to this path to keep working here.",
-            fg="cyan",
-        )
-
 
 project.add_command(epic)
 project.add_command(task)
