@@ -24,6 +24,7 @@
         pkgs.python313Packages.azure-identity
         pkgs.python313Packages.jmespath
         pkgs.python313Packages.pyyaml
+        pkgs.python313Packages.requests
         pkgs.ripgrep
       ];
 
@@ -48,6 +49,9 @@
         python313Packages.azure-identity
         python313Packages.cock
         python313Packages.jmespath
+        python313Packages.pyyaml
+        python313Packages.requests
+        pythonNvim
       ];
 
       shellHook = "echo 'Welcome to a python dev env'";
