@@ -10,7 +10,8 @@ from helpers.shell import run_cmd
 from project_mgmt.scripts import jira, notes as note_helpers
 from project_mgmt.scripts.epic import start_epic
 from project_mgmt.scripts.vault import (
-    epic_dir, epic_note_path, find_task_path, project_dir, require_current_project, slugify,
+    epic_dir, epic_note_path, find_task_path, list_tasks, project_dir, require_current_project,
+    require_epic, slugify,
 )
 
 
@@ -132,6 +133,38 @@ def set_status(task_slug: str, new_state: str, project_slug: Optional[str]):
         jira_key = data.get("jira_key")
         if jira_key:
             jira.transition_issue(jira_key, new_state)
+
+
+@task.command("list")
+@click.option(
+    "--project", "project_slug",
+    help="Project slug to list tasks for. Defaults to the current project "
+    "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name).",
+)
+@click.option("--epic", "epic_slug", help="Scope the listing to this epic only.")
+def list_(project_slug: Optional[str], epic_slug: Optional[str]):
+    """List tasks in a project, or in one epic if --epic is given."""
+    project_slug = require_current_project(project_slug)
+    if epic_slug:
+        require_epic(project_slug, epic_slug)
+    paths = list_tasks(project_slug, epic_slug)
+    if not paths:
+        scope = f"epic '{epic_slug}'" if epic_slug else f"project '{project_slug}'"
+        click.echo(f"No tasks in {scope}.")
+        return
+    for path in paths:
+        data, body = note_helpers.read_frontmatter(path)
+        slug = path.stem
+        title = note_helpers.extract_title(body) or slug
+        status = note_helpers.status_from_tags(data.get("tags", []))
+        line = f"{slug:<24} [{status:<12}] {title}"
+        if not epic_slug and data.get("epic"):
+            line += f"  (epic: {data['epic']})"
+        if data.get("deadline"):
+            line += f"  (due {data['deadline']})"
+        if data.get("jira_key"):
+            line += f"  ({data['jira_key']})"
+        click.echo(line)
 
 
 @task.command("open")

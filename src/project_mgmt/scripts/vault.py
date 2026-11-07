@@ -2,7 +2,7 @@
 
 import re
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import click
 
@@ -78,6 +78,35 @@ def epic_dir(project_slug: str, epic_slug: str) -> Path:
 
 def epic_note_path(project_slug: str, epic_slug: str) -> Path:
     return epic_dir(project_slug, epic_slug) / "_epic.md"
+
+
+def require_epic(project_slug: str, epic_slug: str) -> None:
+    """Raise a clear click.ClickException if the epic doesn't exist yet."""
+    if not epic_note_path(project_slug, epic_slug).exists():
+        raise click.ClickException(
+            f"Epic '{epic_slug}' does not exist under project '{project_slug}'. "
+            f"Run `mycli project epic start {epic_slug} --project={project_slug}` first."
+        )
+
+
+def list_epics(project_slug: str) -> List[Path]:
+    """List epic note paths under a project, sorted by slug."""
+    base = project_dir(project_slug) / "epics"
+    return sorted(base.glob("*/_epic.md")) if base.is_dir() else []
+
+
+def list_tasks(project_slug: str, epic_slug: Optional[str] = None) -> List[Path]:
+    """List task note paths under a project, optionally scoped to one epic."""
+    if epic_slug:
+        tasks_dir = epic_dir(project_slug, epic_slug) / "tasks"
+        return sorted(tasks_dir.glob("*.md")) if tasks_dir.is_dir() else []
+
+    base = project_dir(project_slug)
+    tasks = sorted((base / "tasks").glob("*.md")) if (base / "tasks").is_dir() else []
+    epics_dir = base / "epics"
+    if epics_dir.is_dir():
+        tasks += sorted(epics_dir.glob("*/tasks/*.md"))
+    return tasks
 
 
 def find_task_path(project_slug: str, task_slug: str) -> Optional[Path]:

@@ -90,6 +90,23 @@ def update_status_tag(path: Path, new_state: str) -> None:
     write_frontmatter(path, data, body)
 
 
+def extract_title(body: str) -> str:
+    """Return the first `# heading` found in a note body, or '' if none."""
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("# "):
+            return line[2:].strip()
+    return ""
+
+
+def status_from_tags(tags: Iterable[str]) -> str:
+    """Return the value of the first `status/<x>` tag, or '-' if none."""
+    for tag in tags:
+        if str(tag).startswith("status/"):
+            return str(tag).split("/", 1)[1]
+    return "-"
+
+
 def append_link(note_path: Path, heading: str, link_line: str) -> None:
     """Append link_line as a bullet under `## heading` in note_path, creating the heading if absent."""
     text = note_path.read_text()

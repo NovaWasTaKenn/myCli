@@ -5,7 +5,9 @@ from typing import Optional
 import click
 
 from project_mgmt.scripts import notes as note_helpers
-from project_mgmt.scripts.vault import epic_dir, epic_note_path, project_note_path, require_current_project, slugify
+from project_mgmt.scripts.vault import (
+    epic_dir, epic_note_path, list_epics, project_note_path, require_current_project, require_epic, slugify,
+)
 
 
 @click.group()
@@ -44,14 +46,6 @@ def start_epic(name: str, project_slug: str, deadline: Optional[str] = None, *, 
     return epic_slug
 
 
-def _require_epic(project_slug: str, epic_slug: str) -> None:
-    if not epic_note_path(project_slug, epic_slug).exists():
-        raise click.ClickException(
-            f"Epic '{epic_slug}' does not exist under project '{project_slug}'. "
-            f"Run `mycli project epic start {epic_slug} --project={project_slug}` first."
-        )
-
-
 _PROJECT_OPTION_HELP = (
     "Project slug the epic belongs to. Defaults to the current project "
     "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name)."
@@ -64,7 +58,7 @@ _PROJECT_OPTION_HELP = (
 def prd(epic_slug: str, project_slug: Optional[str]):
     """Open the epic's PRD/plan note, creating it from the planning template if missing."""
     project_slug = require_current_project(project_slug)
-    _require_epic(project_slug, epic_slug)
+    require_epic(project_slug, epic_slug)
     path = epic_dir(project_slug, epic_slug) / "docs" / "planning" / "_prd.md"
     note_helpers.open_or_create(
         path,
@@ -83,7 +77,7 @@ def prd(epic_slug: str, project_slug: Optional[str]):
 def scratchpad(epic_slug: str, project_slug: Optional[str]):
     """Open the epic's scratchpad note (one per epic), creating it from the scratchpad template if missing."""
     project_slug = require_current_project(project_slug)
-    _require_epic(project_slug, epic_slug)
+    require_epic(project_slug, epic_slug)
     path = epic_dir(project_slug, epic_slug) / "docs" / "realisation" / "_scratchpad.md"
     note_helpers.open_or_create(
         path,
@@ -94,6 +88,26 @@ def scratchpad(epic_slug: str, project_slug: Optional[str]):
         template="scratchpad.md",
         title=epic_slug.replace("-", " ").title(),
     )
+
+
+@epic.command("list")
+@click.option("--project", "project_slug", help=_PROJECT_OPTION_HELP)
+def list_(project_slug: Optional[str]):
+    """List epics in a project."""
+    project_slug = require_current_project(project_slug)
+    paths = list_epics(project_slug)
+    if not paths:
+        click.echo(f"No epics in project '{project_slug}'.")
+        return
+    for path in paths:
+        data, body = note_helpers.read_frontmatter(path)
+        slug = path.parent.name
+        title = note_helpers.extract_title(body) or slug
+        status = note_helpers.status_from_tags(data.get("tags", []))
+        line = f"{slug:<24} [{status:<12}] {title}"
+        if data.get("deadline"):
+            line += f"  (due {data['deadline']})"
+        click.echo(line)
 
 
 @epic.command()
