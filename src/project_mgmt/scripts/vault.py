@@ -29,6 +29,11 @@ def slugify(title: str) -> str:
     return slug
 
 
+def local_states() -> List[str]:
+    """List the configured local task states (project_mgmt.states, defaulting to todo/in-progress/done)."""
+    return get_config("project_mgmt.states", default=["todo", "in-progress", "done"])
+
+
 def _git_root(start: Optional[Path] = None) -> Optional[Path]:
     """Walk up from `start` (default cwd) to the nearest directory holding a
     `.git` entry - a repo's `.git` dir, or a submodule's `.git` file."""
@@ -93,6 +98,29 @@ def list_epics(project_slug: str) -> List[Path]:
     """List epic note paths under a project, sorted by slug."""
     base = project_dir(project_slug) / "epics"
     return sorted(base.glob("*/_epic.md")) if base.is_dir() else []
+
+
+def project_slugs() -> List[str]:
+    """List known project slugs (directory names under the vault's projects subdir)."""
+    base = vault_root() / PROJECTS_SUBDIR
+    return sorted(p.name for p in base.iterdir() if p.is_dir()) if base.is_dir() else []
+
+
+def epic_slugs(ctx: click.Context) -> List[str]:
+    """List epic slugs for the project resolved from `ctx` (--project, else current_project())."""
+    project_slug = ctx.params.get("project_slug") or current_project()
+    if not project_slug:
+        return []
+    return [p.parent.name for p in list_epics(project_slug)]
+
+
+def task_slugs(ctx: click.Context) -> List[str]:
+    """List task slugs for the project/epic resolved from `ctx`."""
+    project_slug = ctx.params.get("project_slug") or current_project()
+    if not project_slug:
+        return []
+    epic_slug = ctx.params.get("epic_slug") or ctx.params.get("epic_name")
+    return [p.stem for p in list_tasks(project_slug, epic_slug)]
 
 
 def list_tasks(project_slug: str, epic_slug: Optional[str] = None) -> List[Path]:

@@ -28,6 +28,13 @@
         pkgs.ripgrep
       ];
 
+      nativeBuildInputs = [pkgs.installShellFiles];
+
+      postInstall = ''
+        installShellCompletion --cmd mycli \
+          --zsh <(_MYCLI_COMPLETE=zsh_source $out/bin/mycli)
+      '';
+
       meta = with pkgs.lib; {
         description = "My personal CLI containing all the custom commands i need";
         homepage = "https://github.com/NovaWassTakenn/nova-cli";

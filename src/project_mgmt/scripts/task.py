@@ -1,17 +1,17 @@
 """`mycli project task` commands."""
 
 import sys
-from typing import List, Optional
+from typing import Optional
 
 import click
 
-from helpers.config import get_config
+from helpers.completion import complete_from
 from helpers.shell import run_cmd
 from project_mgmt.scripts import jira, notes as note_helpers
 from project_mgmt.scripts.epic import start_epic
 from project_mgmt.scripts.vault import (
-    epic_dir, epic_note_path, find_task_path, list_tasks, project_dir, require_current_project,
-    require_epic, slugify,
+    epic_dir, epic_note_path, epic_slugs, find_task_path, list_tasks, local_states, project_dir,
+    project_slugs, require_current_project, require_epic, slugify, task_slugs,
 )
 
 
@@ -21,18 +21,21 @@ def task():
     pass
 
 
-def _local_states() -> List[str]:
-    return get_config("project_mgmt.states", default=["todo", "in-progress", "done"])
+_PROJECT_OPTION = click.option(
+    "--project", "project_slug",
+    help="Project slug the task belongs to. Defaults to the current project "
+    "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name).",
+    shell_complete=complete_from(lambda ctx, param, incomplete: project_slugs()),
+)
 
 
 @task.command()
 @click.argument("title")
+@_PROJECT_OPTION
 @click.option(
-    "--project", "project_slug",
-    help="Project slug the task belongs to. Defaults to the current project "
-    "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name).",
+    "--epic", "epic_name", help="Epic name or slug; created automatically if it doesn't exist.",
+    shell_complete=complete_from(lambda ctx, param, incomplete: epic_slugs(ctx)),
 )
-@click.option("--epic", "epic_name", help="Epic name or slug; created automatically if it doesn't exist.")
 @click.option("--deadline", help="Optional deadline, YYYY-MM-DD.")
 @click.option("--description", "edit_description", is_flag=True, help="Open $EDITOR to write a description.")
 @click.option("--description-stdin", "stdin_description", is_flag=True, help="Read the description from stdin.")
@@ -107,16 +110,12 @@ def create(
 
 
 @task.command("status")
-@click.argument("task_slug")
-@click.argument("new_state")
-@click.option(
-    "--project", "project_slug",
-    help="Project slug the task belongs to. Defaults to the current project "
-    "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name).",
-)
+@click.argument("task_slug", shell_complete=complete_from(lambda ctx, param, incomplete: task_slugs(ctx)))
+@click.argument("new_state", shell_complete=complete_from(lambda ctx, param, incomplete: local_states()))
+@_PROJECT_OPTION
 def set_status(task_slug: str, new_state: str, project_slug: Optional[str]):
     """Change a task's local completion state (and its Jira state, if synced)."""
-    states = _local_states()
+    states = local_states()
     if new_state not in states:
         raise click.UsageError(f"'{new_state}' is not a configured state. Choose from: {', '.join(states)}")
 
@@ -136,12 +135,11 @@ def set_status(task_slug: str, new_state: str, project_slug: Optional[str]):
 
 
 @task.command("list")
+@_PROJECT_OPTION
 @click.option(
-    "--project", "project_slug",
-    help="Project slug to list tasks for. Defaults to the current project "
-    "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name).",
+    "--epic", "epic_slug", help="Scope the listing to this epic only.",
+    shell_complete=complete_from(lambda ctx, param, incomplete: epic_slugs(ctx)),
 )
-@click.option("--epic", "epic_slug", help="Scope the listing to this epic only.")
 def list_(project_slug: Optional[str], epic_slug: Optional[str]):
     """List tasks in a project, or in one epic if --epic is given."""
     project_slug = require_current_project(project_slug)
@@ -168,12 +166,8 @@ def list_(project_slug: Optional[str], epic_slug: Optional[str]):
 
 
 @task.command("open")
-@click.argument("task_slug")
-@click.option(
-    "--project", "project_slug",
-    help="Project slug the task belongs to. Defaults to the current project "
-    "(project_mgmt.project / $PROJECT_MGMT_PROJECT, else the nearest git repo's name).",
-)
+@click.argument("task_slug", shell_complete=complete_from(lambda ctx, param, incomplete: task_slugs(ctx)))
+@_PROJECT_OPTION
 def open_task(task_slug: str, project_slug: Optional[str]):
     """Open a task note in the editor."""
     project_slug = require_current_project(project_slug)

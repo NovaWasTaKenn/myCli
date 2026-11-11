@@ -4,9 +4,11 @@ from typing import Optional
 
 import click
 
+from helpers.completion import complete_from
 from project_mgmt.scripts import notes as note_helpers
 from project_mgmt.scripts.vault import (
-    epic_dir, epic_note_path, list_epics, project_note_path, require_current_project, require_epic, slugify,
+    epic_dir, epic_note_path, epic_slugs, list_epics, project_note_path, project_slugs,
+    require_current_project, require_epic, slugify,
 )
 
 
@@ -53,8 +55,11 @@ _PROJECT_OPTION_HELP = (
 
 
 @epic.command()
-@click.argument("epic_slug")
-@click.option("--project", "project_slug", help=_PROJECT_OPTION_HELP)
+@click.argument("epic_slug", shell_complete=complete_from(lambda ctx, param, incomplete: epic_slugs(ctx)))
+@click.option(
+    "--project", "project_slug", help=_PROJECT_OPTION_HELP,
+    shell_complete=complete_from(lambda ctx, param, incomplete: project_slugs()),
+)
 def prd(epic_slug: str, project_slug: Optional[str]):
     """Open the epic's PRD/plan note, creating it from the planning template if missing."""
     project_slug = require_current_project(project_slug)
@@ -72,8 +77,11 @@ def prd(epic_slug: str, project_slug: Optional[str]):
 
 
 @epic.command()
-@click.argument("epic_slug")
-@click.option("--project", "project_slug", help=_PROJECT_OPTION_HELP)
+@click.argument("epic_slug", shell_complete=complete_from(lambda ctx, param, incomplete: epic_slugs(ctx)))
+@click.option(
+    "--project", "project_slug", help=_PROJECT_OPTION_HELP,
+    shell_complete=complete_from(lambda ctx, param, incomplete: project_slugs()),
+)
 def scratchpad(epic_slug: str, project_slug: Optional[str]):
     """Open the epic's scratchpad note (one per epic), creating it from the scratchpad template if missing."""
     project_slug = require_current_project(project_slug)
@@ -91,7 +99,10 @@ def scratchpad(epic_slug: str, project_slug: Optional[str]):
 
 
 @epic.command("list")
-@click.option("--project", "project_slug", help=_PROJECT_OPTION_HELP)
+@click.option(
+    "--project", "project_slug", help=_PROJECT_OPTION_HELP,
+    shell_complete=complete_from(lambda ctx, param, incomplete: project_slugs()),
+)
 def list_(project_slug: Optional[str]):
     """List epics in a project."""
     project_slug = require_current_project(project_slug)
@@ -112,7 +123,10 @@ def list_(project_slug: Optional[str]):
 
 @epic.command()
 @click.argument("name")
-@click.option("--project", "project_slug", help=_PROJECT_OPTION_HELP)
+@click.option(
+    "--project", "project_slug", help=_PROJECT_OPTION_HELP,
+    shell_complete=complete_from(lambda ctx, param, incomplete: project_slugs()),
+)
 @click.option("--deadline", help="Optional deadline, YYYY-MM-DD.")
 def start(name: str, project_slug: Optional[str], deadline: Optional[str]):
     """Start a new epic under an existing project: folder structure, note, and a link from the project."""
